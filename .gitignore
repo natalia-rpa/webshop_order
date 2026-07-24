@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+static/browser_profile/.gitkeep
+static/config/webshop_config.ini
+static/downloads/.gitkeep
+static/logs/.gitkeep
+static/secrets/*.json
+static/secrets/*.pickle
+static/logs/*.log
+static/downloads/*
+!static/downloads/.gitkeep
+static/browser_profile/*
+!static/browser_profile/.gitkeep
+!.gitkeep

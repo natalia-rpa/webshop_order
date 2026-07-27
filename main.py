@@ -12,6 +12,7 @@ process_emails():
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -185,6 +186,184 @@ def check_required_files() -> bool:
     return True
 
 
+def bootstrap_login(timeout_min: int = 10) -> int:
+    """
+    Open REAL Chrome (not Playwright) with the bot profile only
+    (static/browser_profile) — never the user's default Profile 1.
+    """
+    import subprocess
+    import time
+
+    config = load_config()
+    ensure_runtime_dirs(config)
+    logger = _bootstrap_logging(config)
+
+    profile = Path(
+        config.get("webshop", "user_data_dir", fallback="static/browser_profile")
+    ).resolve()
+    profile.mkdir(parents=True, exist_ok=True)
+    (profile / "Default").mkdir(parents=True, exist_ok=True)
+
+    # Make the window obviously the bot profile (not Chrome "Profile 1").
+    _label_bot_chrome_profile(profile, display_name="Hiab Bot")
+
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
+        for path in (profile / name, profile / "Default" / name):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    base_url = config.get("webshop", "base_url")
+    chrome_candidates = [
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+        / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
+        / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Google/Chrome/Application/chrome.exe",
+    ]
+    chrome_exe = next((p for p in chrome_candidates if p.is_file()), None)
+    if chrome_exe is None:
+        logger.error("chrome.exe not found. Install Google Chrome and retry.")
+        return 1
+
+    # Marker page so you can see this is NOT your personal Profile 1.
+    marker = profile / "hiab_bot_login.html"
+    marker.write_text(
+        "<!doctype html><meta charset=utf-8>"
+        "<title>Hiab Bot profile</title>"
+        "<body style='font-family:sans-serif;padding:2rem'>"
+        "<h1>Hiab Bot Chrome profile</h1>"
+        "<p>This is <b>not</b> your personal Profile 1.</p>"
+        f"<p>Profile path: <code>{profile}</code></p>"
+        f"<p><a href='{base_url}'>Open Hiab webshop</a></p>"
+        "</body>",
+        encoding="utf-8",
+    )
+    marker_url = marker.resolve().as_uri()
+
+    logger.info("======= Webshop login bootstrap v%s (real Chrome) =======", VERSION)
+    logger.info("Bot profile ONLY: %s", profile)
+    logger.info(
+        "Opening a separate Chrome instance labeled 'Hiab Bot'. "
+        "If you still see Profile 1, close personal Chrome and retry."
+    )
+    logger.info("Start page: %s", marker_url)
+
+    # Separate user-data-dir forces a second Chrome process (not Profile 1).
+    # Keep args before the URL; quote-safe absolute path.
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+
+    subprocess.Popen(
+        [
+            str(chrome_exe),
+            f"--user-data-dir={profile}",
+            "--profile-directory=Default",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--new-window",
+            marker_url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        close_fds=True,
+    )
+
+    # Launcher chrome.exe often exits immediately after spawning the real
+    # browser process — wait until no Chrome still uses our user-data-dir.
+    time.sleep(2.0)
+    if not _chrome_using_user_data_dir(profile):
+        logger.error(
+            "Chrome did not start with bot profile %s. "
+            "Close all Chrome windows and run: python main.py --login",
+            profile,
+        )
+        return 1
+
+    deadline = time.time() + max(1, timeout_min) * 60
+    logger.info(
+        "Waiting until you CLOSE the Hiab Bot Chrome window (up to %s min)...",
+        timeout_min,
+    )
+    while time.time() < deadline:
+        if not _chrome_using_user_data_dir(profile):
+            logger.info(
+                "Hiab Bot Chrome closed. Session is in %s. "
+                "Run the robot normally next (without --login).",
+                profile,
+            )
+            return 0
+        time.sleep(2.0)
+
+    logger.warning(
+        "Timeout waiting for Hiab Bot Chrome to close. "
+        "Close it manually when login is done."
+    )
+    return 1
+
+
+def _label_bot_chrome_profile(profile: Path, display_name: str = "Hiab Bot") -> None:
+    """Set Chrome UI profile name so the avatar menu shows Hiab Bot."""
+    import json
+
+    local_state_path = profile / "Local State"
+    data: dict = {}
+    if local_state_path.is_file():
+        try:
+            data = json.loads(local_state_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    profile_block = data.setdefault("profile", {})
+    info = profile_block.setdefault("info_cache", {})
+    default = info.setdefault("Default", {})
+    default["name"] = display_name
+    default["shortcut_name"] = display_name
+    profile_block["last_used"] = "Default"
+    local_state_path.write_text(json.dumps(data), encoding="utf-8")
+
+    prefs_path = profile / "Default" / "Preferences"
+    if prefs_path.is_file():
+        try:
+            prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+            prefs.setdefault("profile", {})["name"] = display_name
+            prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _chrome_using_user_data_dir(user_data_dir: Path) -> bool:
+    """True if any chrome.exe process was started with this --user-data-dir."""
+    import subprocess
+
+    needle = str(user_data_dir).lower().replace("/", "\\")
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" "
+                "| Select-Object -ExpandProperty CommandLine",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        # Fallback: SingletonLock means a Chrome instance holds the profile.
+        return (user_data_dir / "SingletonLock").exists()
+
+    for line in (result.stdout or "").splitlines():
+        normalized = line.lower().replace("/", "\\")
+        if needle in normalized and "--user-data-dir" in normalized:
+            return True
+    return (user_data_dir / "SingletonLock").exists()
+
+
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(description="Hiab Webshop Order Robot")
     parser.add_argument(
@@ -198,6 +377,17 @@ def main(argv: Optional[list] = None) -> int:
         action="store_true",
         help="Only verify required secret/config files exist.",
     )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="Open real Chrome (not Playwright) for one-time manual login into the bot profile.",
+    )
+    parser.add_argument(
+        "--login-timeout-min",
+        type=int,
+        default=10,
+        help="Minutes to wait for impersonator during --login (default: 10).",
+    )
     args = parser.parse_args(argv)
 
     if args.check:
@@ -207,6 +397,8 @@ def main(argv: Optional[list] = None) -> int:
         return 1
 
     try:
+        if args.login:
+            return bootstrap_login(timeout_min=args.login_timeout_min)
         process_emails(max_orders=args.max)
         return 0
     except KeyboardInterrupt:

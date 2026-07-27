@@ -43,10 +43,27 @@ def _read_csv_flexible(source: Path) -> pd.DataFrame:
         )
 
 
+# Headers required by webshop Batch Order upload (row 1).
+ITEM_HEADER = "Item number"
+QTY_HEADER = "Order amount"
+_HEADER_LIKE = {
+    "item",
+    "item number",
+    "itemnumber",
+    "part",
+    "part number",
+    "order amount",
+    "qty",
+    "quantity",
+}
+
+
 def load_items_dataframe(source_csv: Union[str, Path]) -> pd.DataFrame:
     """
     Load attachment CSV into a dataframe with columns:
       item (col A), qty (col B)
+
+    Row 1 may be headers; header-like / empty A+B rows are skipped.
     """
     source = Path(source_csv)
     if not source.exists():
@@ -62,7 +79,8 @@ def load_items_dataframe(source_csv: Union[str, Path]) -> pd.DataFrame:
     items.columns = ["item", "qty"]
     items["item"] = items["item"].astype(str).str.strip()
     items["qty"] = items["qty"].astype(str).str.strip()
-    items = items[~((items["item"] == "") & (items["qty"] == ""))].reset_index(drop=True)
+    items = items[~((items["item"] == "") & (items["qty"] == ""))]
+    items = items[~items["item"].str.lower().isin(_HEADER_LIKE)].reset_index(drop=True)
 
     logger.info(
         "Loaded shopping list from %s: %s item row(s).",
@@ -79,8 +97,8 @@ def split_into_batches(
     batch_size: int = DEFAULT_BATCH_MAX_ROWS,
 ) -> List[Path]:
     """
-    Write item/qty rows as headerless CSVs in chunks of `batch_size`
-    (webshop Batch Order accepts max 100 rows per upload).
+    Write item/qty CSVs with headers in row 1, data from row 2, in chunks of
+    `batch_size` (webshop Batch Order accepts max 100 data rows per upload).
     """
     if batch_size < 1:
         raise ValueError("batch_size must be >= 1")
@@ -96,10 +114,11 @@ def split_into_batches(
     num_batches = (total + batch_size - 1) // batch_size
 
     for i in range(num_batches):
-        chunk = items.iloc[i * batch_size : (i + 1) * batch_size]
+        chunk = items.iloc[i * batch_size : (i + 1) * batch_size].copy()
+        chunk.columns = [ITEM_HEADER, QTY_HEADER]
         name = f"{stem}_batch_{i + 1:02d}_of_{num_batches:02d}.csv"
         target = out_dir / name
-        chunk.to_csv(target, index=False, header=False)
+        chunk.to_csv(target, index=False, header=True)
         paths.append(target)
         logger.info(
             "Wrote batch file %s (%s rows, batch %s/%s).",
@@ -149,6 +168,7 @@ def extract_columns_ab(
     out_dir.mkdir(parents=True, exist_ok=True)
     name = output_name or f"{source.stem}_ab.csv"
     target = out_dir / name
-    items.to_csv(target, index=False, header=False)
+    out = items.rename(columns={"item": ITEM_HEADER, "qty": QTY_HEADER})
+    out.to_csv(target, index=False, header=True)
     logger.info("Prepared batch CSV with columns A/B: %s (%s rows).", target, len(items))
     return target

@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
 from playwright.sync_api import (
-    Browser,
     BrowserContext,
     Page,
     Playwright,
@@ -37,7 +36,7 @@ class WebshopBot:
     6. Find user (impersonate)
     7. Batch Order uploads
 
-    Session reuse: Playwright storage_state (cookies + localStorage JSON).
+    Session reuse: persistent Chrome profile (user_data_dir / cloned Profile 1).
     """
 
     def __init__(
@@ -48,7 +47,6 @@ class WebshopBot:
         self.config = config or load_config()
         self.on_phase = on_phase or (lambda phase, detail: None)
         self._playwright: Optional[Playwright] = None
-        self._browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
 
@@ -66,11 +64,11 @@ class WebshopBot:
         self.nav_timeout = self.config.getint(
             "webshop", "navigation_timeout_ms", fallback=90000
         )
-        self.storage_state_path = self.config.get(
+        self.user_data_dir = self.config.get(
             "webshop",
-            "storage_state_path",
-            fallback="static/session/storage_state.json",
-        ).strip() or "static/session/storage_state.json"
+            "user_data_dir",
+            fallback="static/browser_profile",
+        ).strip() or "static/browser_profile"
 
     def _phase(self, detail: str) -> None:
         self.on_phase("PROCESSING", detail)
@@ -90,48 +88,49 @@ class WebshopBot:
             logger.debug("networkidle not reached; continuing after settle sleep.")
         time.sleep(settle_s)
 
-    def _save_storage_state(self) -> None:
-        """Persist cookies + localStorage for the next run."""
-        assert self.context is not None
-        path = Path(self.storage_state_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.context.storage_state(path=str(path))
-        logger.info("Saved storage_state to %s", path)
+    @staticmethod
+    def _clear_profile_locks(user_data_dir: Path) -> None:
+        """Remove Chrome lock files left from a previous unclean exit."""
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
+            for path in (
+                user_data_dir / name,
+                user_data_dir / "Default" / name,
+            ):
+                try:
+                    if path.exists() or path.is_symlink():
+                        path.unlink(missing_ok=True)
+                        logger.debug("Removed profile lock: %s", path)
+                except OSError:
+                    pass
 
     def start(self) -> Page:
         logger.info("Initializing browser...")
+        profile = Path(self.user_data_dir)
+        profile.mkdir(parents=True, exist_ok=True)
+        self._clear_profile_locks(profile)
+        logger.info("Using bot Chrome profile: %s", profile.resolve())
         self._playwright = sync_playwright().start()
         logger.info("Launching Chrome...")
-        self._browser = self._playwright.chromium.launch(
+        self.context = self._playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile),
             channel="chrome",
             headless=self.headless,
             slow_mo=self.slow_mo,
+            accept_downloads=True,
+            viewport={"width": 1440, "height": 900},
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--password-store=basic",
                 "--disable-save-password-bubble",
                 "--disable-features=PasswordManagerOnboarding,PasswordCheck",
+                "--disable-session-crashed-bubble",
             ],
         )
-
-        context_kwargs: dict = {
-            "accept_downloads": True,
-            "viewport": {"width": 1440, "height": 900},
-        }
-        state_path = Path(self.storage_state_path)
-        if state_path.is_file():
-            context_kwargs["storage_state"] = str(state_path)
-            logger.info("Loading storage_state from %s", state_path)
-        else:
-            logger.info(
-                "No storage_state at %s yet; will save after first successful login.",
-                state_path,
-            )
-
-        self.context = self._browser.new_context(**context_kwargs)
         self.context.set_default_timeout(self.timeout)
         self.context.set_default_navigation_timeout(self.nav_timeout)
-        self.page = self.context.new_page()
+        self.page = (
+            self.context.pages[0] if self.context.pages else self.context.new_page()
+        )
         logger.info("Browser ready; continuing with login steps.")
         self._goto_webshop()
         return self.page
@@ -152,13 +151,7 @@ class WebshopBot:
                     self.context.close()
                 except Exception:
                     pass
-            if self._browser is not None:
-                try:
-                    self._browser.close()
-                except Exception:
-                    pass
         finally:
-            self._browser = None
             self.context = None
             self.page = None
             if self._playwright:
@@ -219,7 +212,6 @@ class WebshopBot:
             self._handle_passkey_continue()
             self._click_verify_button()
             self._handle_microsoft_auth()
-        self._save_storage_state()
         self._impersonate_user(client_number, client_name)
         self._open_batch_order()
 
@@ -303,7 +295,7 @@ class WebshopBot:
     def _login(self) -> bool:
         """
         Sign in if needed.
-        Returns True when an existing storage_state session is already signed in.
+        Returns True when an existing profile session is already signed in.
         """
         assert self.page is not None
         page = self.page
@@ -314,7 +306,7 @@ class WebshopBot:
         self._dismiss_cookie_banner(page)
 
         if page.locator('[data-testid="impersonator-toggle-button"]').count() > 0:
-            logger.info("Already signed in (storage_state session restored).")
+            logger.info("Already signed in (Chrome profile session restored).")
             return True
 
         # Direct login URL avoids Sign-in click behind cookie overlay

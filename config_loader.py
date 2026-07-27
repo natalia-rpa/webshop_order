@@ -51,15 +51,8 @@ def batch_max_rows(config: configparser.ConfigParser) -> int:
 
 def ensure_runtime_dirs(config: configparser.ConfigParser) -> None:
     Path(config.get("webshop", "downloads_dir")).mkdir(parents=True, exist_ok=True)
-    state = config.get(
-        "webshop",
-        "storage_state_path",
-        fallback="static/session/storage_state.json",
-    ).strip()
-    if state:
-        Path(state).parent.mkdir(parents=True, exist_ok=True)
-    # Legacy bot profile dir (harmless if unused)
-    if config.has_option("webshop", "user_data_dir"):
-        Path(config.get("webshop", "user_data_dir")).mkdir(parents=True, exist_ok=True)
+    Path(
+        config.get("webshop", "user_data_dir", fallback="static/browser_profile")
+    ).mkdir(parents=True, exist_ok=True)
     Path(config.get("paths", "batch_csv_dir")).mkdir(parents=True, exist_ok=True)
     Path(config.get("logging", "log_file")).parent.mkdir(parents=True, exist_ok=True)

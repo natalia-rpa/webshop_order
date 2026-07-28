@@ -9,9 +9,10 @@ process_emails():
   5. Update ROBOT_PHASE (PROCESSING / ERROR / FINISHED)
 
 run_unattended():
-  Background loop — keeps one signed-in Chrome session alive, polls MAIN
-  every N seconds (default 60), processes when MANUAL_PHASE=VALID and
-  ROBOT_PHASE empty. If session is dead, run: python main.py --login
+  Background loop — Chrome runs hidden (logs only), polls MAIN every N
+  seconds (default 60), processes when MANUAL_PHASE=VALID and ROBOT_PHASE
+  empty. Reuses the signed-in bot profile. If session is dead, run:
+  python main.py --login
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from spreadsheet_processing import (
     extract_order_payload,
     find_pending_orders,
     set_robot_phase,
+    set_timestamp_processed_at,
 )
 from webshop_bot import WebshopBot
 
@@ -98,6 +100,7 @@ def process_single_order(
 
     owns_bot = bot is None
     try:
+        set_timestamp_processed_at(sheet, order.row_number, config)
         set_robot_phase(sheet, order.row_number, "PROCESSING", "Extracting row data", config)
 
         if not order.client_number:
@@ -146,12 +149,6 @@ def process_single_order(
 
     except Exception as exc:
         reason = str(exc).strip() or type(exc).__name__
-        # Session loss must stop unattended — do not mark a row ERROR forever.
-        if require_existing_session and (
-            "session is not active" in reason.lower()
-            or "python main.py --login" in reason
-        ):
-            raise
         logger.error("Error processing row %s: %s", order.row_number, reason)
         logger.error(traceback.format_exc())
         try:
@@ -234,8 +231,9 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
     """
     Background unattended loop with a long-lived signed-in Chrome session.
 
-    Chrome stays open for the whole run (attach to --login session when present).
-    Polls MAIN, processes rows already signed in — no password/MFA re-login.
+    Runs Chrome hidden (headless) — only logs are visible. Reuses the signed-in
+    bot profile from --login (no password/MFA re-login). Polls MAIN for rows
+    with MANUAL_PHASE=VALID and ROBOT_PHASE empty.
     If the session is not active, stop and run: python main.py --login
     """
     config = load_config()
@@ -249,12 +247,12 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
     cdp_port = config.getint("webshop", "cdp_port", fallback=9222)
     logger.info("======= Webshop Order Robot v%s — UNATTENDED =======", VERSION)
     logger.info(
-        "Keeping one active webshop session (CDP %s). "
-        "Polling every %ss for MANUAL_PHASE=VALID & ROBOT_PHASE empty "
-        "(headless=%s).",
+        "Hidden Chrome session (CDP %s, headless=%s). "
+        "Polling every %ss for MANUAL_PHASE=VALID & ROBOT_PHASE empty. "
+        "Only logs are shown.",
         cdp_port,
-        poll_sec,
         force_headless,
+        poll_sec,
     )
 
     bot: Optional[WebshopBot] = None
@@ -271,7 +269,7 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
             return 1
 
         logger.info(
-            "Active session locked in. Leave this Chrome window open. "
+            "Active session locked in (Chrome hidden). "
             "Orders will run without signing in again."
         )
 
@@ -364,10 +362,11 @@ def bootstrap_login(timeout_min: int = 10) -> int:
         bot.start()
         bot.wait_until_impersonator_ready(timeout_ms=max(1, timeout_min) * 60_000)
         logger.info(
-            "Active session ready. Keep this Chrome window open, then run:\n"
+            "Active session ready. You can close this Chrome window, then run:\n"
             "  python main.py --unattended\n"
             "or:\n"
-            "  python unattended_main.py"
+            "  python unattended_main.py\n"
+            "(Unattended starts Chrome hidden — only logs are visible.)"
         )
         # Disconnect Playwright only — Chrome stays signed in.
         bot.stop(keep_browser=True)
@@ -429,7 +428,7 @@ def main(argv: Optional[list] = None) -> int:
         action="store_true",
         help=(
             "Open/attach bot Chrome and wait until the webshop session is active. "
-            "Leave that window open for unattended mode."
+            "Then run --unattended (Chrome will be hidden; logs only)."
         ),
     )
     parser.add_argument(
@@ -442,8 +441,9 @@ def main(argv: Optional[list] = None) -> int:
         "--unattended",
         action="store_true",
         help=(
-            "Background mode: keep one signed-in Chrome session alive, poll MAIN "
-            "every poll_interval_sec (default 60s), process VALID rows without re-login."
+            "Hidden background mode: run Chrome headless (logs only), keep the "
+            "signed-in session alive, poll MAIN every poll_interval_sec "
+            "(default 60s), process VALID rows without re-login."
         ),
     )
     args = parser.parse_args(argv)

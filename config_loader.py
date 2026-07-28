@@ -55,8 +55,8 @@ def unattended_poll_interval_sec(config: configparser.ConfigParser) -> int:
 
 
 def unattended_headless(config: configparser.ConfigParser) -> bool:
-    """Whether unattended mode forces headless Chrome."""
-    return config.getboolean("unattended", "headless", fallback=False)
+    """Whether unattended mode runs Chrome hidden (headless). Default True."""
+    return config.getboolean("unattended", "headless", fallback=True)
 
 
 def webshop_cdp_port(config: configparser.ConfigParser) -> int:

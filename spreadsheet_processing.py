@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -114,6 +115,39 @@ def set_robot_phase(
 
     safe_update_cell(sheet, row_number, col_idx, text)
     logger.info("ROBOT_PHASE row %s -> %s", row_number, text)
+
+
+def set_timestamp_processed_at(
+    sheet: gspread.Worksheet,
+    row_number: int,
+    config=None,
+    *,
+    when: Optional[datetime] = None,
+) -> str:
+    """
+    Write TIMESTAMP_PROCESSED_AT (column K) when a row starts processing.
+    Returns the timestamp string written to the sheet.
+    """
+    config = config or load_config()
+    stamp = (when or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+    headers = sheet.row_values(1)
+    header_map = build_header_map(headers)
+    col_name = config.get(
+        "columns", "timestamp_processed_at", fallback="TIMESTAMP_PROCESSED_AT"
+    )
+    try:
+        col_idx = resolve_column(header_map, col_name) + 1  # 1-based
+    except KeyError:
+        # Column K fallback when header is missing / renamed.
+        col_idx = 11
+        logger.warning(
+            "Column %r not in headers; writing TIMESTAMP_PROCESSED_AT to column K.",
+            col_name,
+        )
+
+    safe_update_cell(sheet, row_number, col_idx, stamp)
+    logger.info("TIMESTAMP_PROCESSED_AT row %s -> %s", row_number, stamp)
+    return stamp
 
 
 def find_pending_orders(

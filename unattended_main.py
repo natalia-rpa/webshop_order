@@ -1,13 +1,13 @@
 """
-Unattended entry point — background operation with a long-lived signed-in session.
+Unattended entry point — hidden background operation with a signed-in session.
 
-Keeps one bot Chrome session active, polls MAIN every poll_interval_sec
-(default 60s), and processes rows where MANUAL_PHASE=VALID and ROBOT_PHASE
-is empty — without signing in again.
+Runs Chrome headless (no window; logs only), keeps the bot session active,
+polls MAIN every poll_interval_sec (default 60s), and processes rows where
+MANUAL_PHASE=VALID and ROBOT_PHASE is empty — without signing in again.
 
 If the session is not active first run:
   python main.py --login
-then:
+then (you can close the login Chrome window):
   python unattended_main.py
   python unattended_main.py --max 1
 """

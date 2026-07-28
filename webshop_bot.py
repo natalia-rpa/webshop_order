@@ -32,11 +32,10 @@ class WebshopBot:
     """
     Browser flow:
     1. Open webshop -> Sign in
-    2. Username / password -> Log in
-    3. Passkey popup (Continue for hiabdeals@hiab.com)
-    4. Already in shop (Microsoft auth only if still required)
-    5. Find user (impersonate)
-    6. Batch Order uploads
+    2. Login with SSO (reuse Chrome/SSO session; skips password + Verify)
+    3. Already in shop (passkey / Microsoft only if SSO still prompts)
+    4. Find user (impersonate)
+    5. Batch Order uploads
 
     Session reuse: real Chrome on user_data_dir, Playwright attached via CDP
     (same profile as --login; avoids Playwright automation flags).
@@ -689,7 +688,7 @@ class WebshopBot:
 
             already_signed_in = self._login()
             if not already_signed_in:
-                # Passkey dialog appears after Log in -> Continue -> already in shop.
+                # SSO usually lands already in shop; only handle leftover prompts.
                 self._handle_passkey_continue()
                 self._handle_microsoft_auth()
 
@@ -775,8 +774,9 @@ class WebshopBot:
 
     def _login(self) -> bool:
         """
-        Sign in if needed.
-        Returns True when an existing profile session is already signed in.
+        Sign in if needed via Login with SSO (skips password + Verify when
+        the Chrome profile already has an active SSO session).
+        Returns True when already signed in (or SSO completed into shop).
         """
         assert self.page is not None
         page = self.page
@@ -807,30 +807,33 @@ class WebshopBot:
                 sign_in.click(force=True)
             self._wait_loaded(page, settle_s=2.0)
 
-        self._phase(f"Entering credentials for {self.username}")
-        user_input = page.locator(
-            'input[placeholder="Username"], input[type="text"][required]'
+        self._phase("Clicking Login with SSO")
+        sso_btn = page.locator(
+            'button.sso-button, '
+            'button.slds-button.sso-button, '
+            'button:has-text("Login with SSO")'
         ).first
-        pass_input = page.locator(
-            'input[placeholder="Password"], input[type="password"]'
-        ).first
-        user_input.wait_for(state="visible")
-        self._fill_exact(user_input, self.username)
-        self._fill_exact(pass_input, self.password)
-        logger.info(
-            "Entered login credentials for %s (password length=%s).",
-            self.username,
-            len(self.password),
-        )
-
-        self._phase("Submitting login form")
-        login_btn = page.locator(
-            'button.loginButton, button:has-text("Log in")'
-        ).first
-        login_btn.click()
+        sso_btn.wait_for(state="visible", timeout=20000)
+        try:
+            sso_btn.click(timeout=10000)
+        except Exception:
+            sso_btn.click(force=True)
+        logger.info("Clicked Login with SSO.")
         self._wait_loaded(page, settle_s=2.0)
-        logger.info("Clicked the Log in button.")
         time.sleep(1.5)
+
+        # SSO reuses existing session — often lands already in the shop.
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            if self.is_signed_in():
+                logger.info("Signed in via Login with SSO (verification skipped).")
+                return True
+            time.sleep(0.8)
+
+        logger.warning(
+            "Login with SSO clicked but signed-in state not confirmed yet; "
+            "continuing with any leftover auth prompts."
+        )
         return False
 
     def _handle_passkey_continue(self) -> None:

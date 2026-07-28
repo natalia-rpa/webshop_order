@@ -53,6 +53,7 @@ class WebshopBot:
         self._browser: Optional[Browser] = None
         self._chrome_proc: Optional[subprocess.Popen] = None
         self._cdp_port: Optional[int] = None
+        self._owns_chrome = False
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
 
@@ -75,9 +76,8 @@ class WebshopBot:
             "user_data_dir",
             fallback="static/browser_profile",
         ).strip() or "static/browser_profile"
-        self.cdp_port = self.config.getint(
-            "webshop", "cdp_port", fallback=0
-        )
+        # Fixed port (default 9222) so --login and unattended share one Chrome.
+        self.cdp_port = self.config.getint("webshop", "cdp_port", fallback=9222)
 
     def _phase(self, detail: str) -> None:
         self.on_phase("PROCESSING", detail)
@@ -133,68 +133,95 @@ class WebshopBot:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
-    def start(self) -> Page:
+    @staticmethod
+    def _cdp_reachable(port: int, timeout_s: float = 0.4) -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout_s):
+                return True
+        except OSError:
+            return False
+
+    def start(self, *, attach_only: bool = False) -> Page:
         """
-        Launch real Chrome on the bot profile (same as --login), then attach
-        Playwright over CDP. Avoids Playwright's automation flags that break
-        the restored webshop/passkey session.
+        Attach Playwright to the bot Chrome over CDP (same profile as --login).
+
+        Prefers an already-running Chrome on cdp_port so the signed-in session
+        stays active. Launches Chrome only when nothing is listening.
         """
         logger.info("Initializing browser...")
         profile = Path(self.user_data_dir).resolve()
         profile.mkdir(parents=True, exist_ok=True)
-        self._clear_profile_locks(profile)
         logger.info("Using bot Chrome profile: %s", profile)
 
-        chrome_exe = self._find_chrome_exe()
         port = self.cdp_port if self.cdp_port > 0 else self._pick_free_port()
         self._cdp_port = port
-
-        chrome_args = [
-            str(chrome_exe),
-            f"--user-data-dir={profile}",
-            "--profile-directory=Default",
-            f"--remote-debugging-port={port}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-session-crashed-bubble",
-            "--password-store=basic",
-            "--disable-save-password-bubble",
-        ]
-        if self.headless:
-            chrome_args.append("--headless=new")
-        chrome_args.append(self.base_url)
-
-        logger.info("Launching real Chrome (CDP port %s)...", port)
-        creationflags = 0
-        if sys.platform == "win32":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        self._chrome_proc = subprocess.Popen(
-            chrome_args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
-
-        self._playwright = sync_playwright().start()
         cdp_url = f"http://127.0.0.1:{port}"
-        deadline = time.time() + 45
-        last_err: Optional[Exception] = None
-        while time.time() < deadline:
-            if self._chrome_proc.poll() is not None:
-                raise RuntimeError(
-                    f"Chrome exited early (code {self._chrome_proc.returncode}). "
-                    "Close other Hiab Bot Chrome windows and retry."
-                )
+        self._playwright = sync_playwright().start()
+
+        attached_existing = False
+        if self._cdp_reachable(port):
+            logger.info("Active Chrome CDP found on port %s — attaching.", port)
             try:
                 self._browser = self._playwright.chromium.connect_over_cdp(cdp_url)
-                break
+                attached_existing = True
+                self._owns_chrome = False
             except Exception as exc:
-                last_err = exc
-                time.sleep(0.4)
-        else:
-            raise RuntimeError(
-                f"Could not attach to Chrome CDP at {cdp_url}: {last_err}"
+                logger.warning("CDP attach failed (%s); will launch Chrome.", exc)
+
+        if not attached_existing:
+            if attach_only:
+                raise RuntimeError(
+                    f"No active Chrome session on CDP port {port}. "
+                    "Run: python main.py --login"
+                )
+            self._clear_profile_locks(profile)
+            chrome_exe = self._find_chrome_exe()
+            chrome_args = [
+                str(chrome_exe),
+                f"--user-data-dir={profile}",
+                "--profile-directory=Default",
+                f"--remote-debugging-port={port}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-session-crashed-bubble",
+                "--password-store=basic",
+                "--disable-save-password-bubble",
+            ]
+            if self.headless:
+                chrome_args.append("--headless=new")
+            chrome_args.append(self.base_url)
+
+            logger.info("Launching real Chrome (CDP port %s)...", port)
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            self._chrome_proc = subprocess.Popen(
+                chrome_args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
             )
+            self._owns_chrome = True
+
+            deadline = time.time() + 45
+            last_err: Optional[Exception] = None
+            while time.time() < deadline:
+                if self._chrome_proc.poll() is not None:
+                    raise RuntimeError(
+                        f"Chrome exited early (code {self._chrome_proc.returncode}). "
+                        "Close other Hiab Bot Chrome windows and retry, "
+                        "or run: python main.py --login"
+                    )
+                try:
+                    self._browser = self._playwright.chromium.connect_over_cdp(cdp_url)
+                    break
+                except Exception as exc:
+                    last_err = exc
+                    time.sleep(0.4)
+            else:
+                raise RuntimeError(
+                    f"Could not attach to Chrome CDP at {cdp_url}: {last_err}"
+                )
 
         assert self._browser is not None
         if not self._browser.contexts:
@@ -204,7 +231,11 @@ class WebshopBot:
         self.context.set_default_navigation_timeout(self.nav_timeout)
 
         self.page = self._pick_webshop_page() or self.context.new_page()
-        logger.info("Browser ready via CDP; continuing with login steps.")
+        logger.info(
+            "Browser ready via CDP (port %s, owns_chrome=%s).",
+            port,
+            self._owns_chrome,
+        )
         self._goto_webshop()
         return self.page
 
@@ -221,18 +252,24 @@ class WebshopBot:
         assert self.page is not None
         url = self.base_url
         logger.info("Navigating to %s", url)
-        self.page.goto(url, wait_until="domcontentloaded", timeout=self.nav_timeout)
-        self._wait_loaded(self.page, settle_s=1.0)
+        self._safe_goto(url)
         logger.info("Opened: %s", self.page.url)
 
-    def stop(self) -> None:
+    def stop(self, *, keep_browser: bool = False) -> None:
+        """
+        Disconnect Playwright.
+
+        keep_browser=True leaves Chrome running so the signed-in session stays
+        active for the next --unattended / --login attach.
+        """
+        leave_chrome = keep_browser or not self._owns_chrome
         try:
             if self._browser is not None:
                 try:
                     self._browser.close()
                 except Exception:
                     pass
-            elif self.context is not None:
+            elif self.context is not None and not leave_chrome:
                 try:
                     self.context.close()
                 except Exception:
@@ -241,7 +278,7 @@ class WebshopBot:
             self._browser = None
             self.context = None
             self.page = None
-            if self._chrome_proc is not None:
+            if not leave_chrome and self._chrome_proc is not None:
                 try:
                     if self._chrome_proc.poll() is None:
                         self._chrome_proc.terminate()
@@ -252,13 +289,19 @@ class WebshopBot:
                 except Exception:
                     pass
                 self._chrome_proc = None
+                logger.info("Browser closed.")
+            else:
+                self._chrome_proc = None
+                logger.info(
+                    "Disconnected from Chrome; session left active on CDP port %s.",
+                    self._cdp_port,
+                )
             if self._playwright:
                 try:
                     self._playwright.stop()
                 except Exception:
                     pass
                 self._playwright = None
-            logger.info("Browser closed.")
 
     def __enter__(self) -> "WebshopBot":
         self.start()
@@ -267,16 +310,203 @@ class WebshopBot:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.stop()
 
+    def is_signed_in(self) -> bool:
+        """True when signed-in UI is present (impersonator control preferred)."""
+        assert self.page is not None
+        page = self.page
+        try:
+            toggle = page.locator(self._impersonator_toggle_selector())
+            if toggle.count() > 0:
+                return True
+
+            for selector in (
+                'a.l-s-header__link-user-nav:has-text("Sign out")',
+                'button:has-text("Sign out")',
+                '[data-testid="impersonator"]',
+                ".c-impersonator",
+            ):
+                loc = page.locator(selector)
+                if loc.count() > 0:
+                    return True
+
+            sign_in = page.locator(
+                'a.l-s-header__link-user-nav:has-text("Sign in"), '
+                'a[href*="/login/ExternalLogin"]'
+            )
+            if sign_in.count() > 0:
+                try:
+                    return not sign_in.first.is_visible()
+                except Exception:
+                    return False
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _impersonator_toggle_selector() -> str:
+        return (
+            '[data-testid="impersonator-toggle-button"], '
+            'button[data-testid="impersonator-toggle-button"], '
+            'button.c-impersonator__toggle, '
+            'button:has-text("Add user"), '
+            'button:has-text("Find user")'
+        )
+
+    def _stop_impersonation_if_needed(self) -> None:
+        """Leave a previous customer impersonation so Find user works again."""
+        assert self.page is not None
+        page = self.page
+        for selector in (
+            '[data-testid="impersonator-signout"] a',
+            '[data-testid="impersonator-signout"]',
+            "div.c-impersonator__signout a",
+            "div.c-impersonator__signout",
+            'a:has-text("Sign out as user")',
+            'button:has-text("Stop impersonating")',
+            'button:has-text("Exit impersonation")',
+            'a:has-text("Stop impersonating")',
+            '[data-testid="impersonator-stop-button"]',
+            'button.c-impersonator__stop',
+        ):
+            loc = page.locator(selector)
+            try:
+                if loc.count() == 0:
+                    continue
+                target = loc.first
+                if not target.is_visible():
+                    continue
+                target.click(timeout=5000)
+                logger.info("Signed out as impersonated user via %s.", selector)
+                self._wait_loaded(page, settle_s=1.5)
+                return
+            except Exception:
+                continue
+
+    def _open_impersonator_toggle(self) -> None:
+        """Open the Find/Add user control; recover with reload if needed."""
+        assert self.page is not None
+        page = self.page
+        selector = self._impersonator_toggle_selector()
+
+        for attempt in range(1, 4):
+            self._dismiss_cookie_banner(page)
+            self._stop_impersonation_if_needed()
+            toggle = page.locator(selector).first
+            try:
+                # Prefer visible; fall back to attached + force (header can be sticky/obscured).
+                try:
+                    toggle.wait_for(state="visible", timeout=12_000)
+                    toggle.click(timeout=5000)
+                except PlaywrightTimeout:
+                    if toggle.count() == 0:
+                        raise
+                    logger.warning(
+                        "Impersonator toggle not visible (attempt %s); force-clicking.",
+                        attempt,
+                    )
+                    toggle.wait_for(state="attached", timeout=5_000)
+                    toggle.click(force=True, timeout=5000)
+
+                search = page.locator(
+                    'input[data-testid="impersonator-user-search-input"], '
+                    'input.c-impersonator__input-search, '
+                    "#downshift-0-input, "
+                    "input[id^='downshift-'][id$='-input']"
+                ).first
+                search.wait_for(state="visible", timeout=8_000)
+                return
+            except Exception as exc:
+                logger.warning(
+                    "Could not open impersonator (attempt %s/%s, url=%s): %s",
+                    attempt,
+                    3,
+                    page.url,
+                    exc,
+                )
+                self._safe_goto(self.base_url)
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=self.nav_timeout)
+                except Exception:
+                    pass
+                self._wait_loaded(page, settle_s=1.5)
+
+        raise TimeoutError(
+            "Impersonator (Find/Add user) control not available after retries. "
+            f"url={page.url!r}. If the header looks wrong, run: python main.py --login"
+        )
+
+    def ensure_signed_in_session(self, wait_ms: int = 30_000) -> None:
+        """
+        Confirm the shared Chrome session is signed in.
+        Waits for the header to settle — do not treat a slow render as logged out.
+        """
+        assert self.page is not None
+        page = self.page
+        self._phase(f"Checking active session for {self.username}")
+        self._safe_goto(self.base_url)
+        self._dismiss_cookie_banner(page)
+
+        deadline = time.time() + max(1, wait_ms) / 1000
+        while time.time() < deadline:
+            if self.is_signed_in():
+                logger.info("Active signed-in webshop session confirmed.")
+                return
+            time.sleep(0.5)
+
+        # One hard refresh before giving up (page may be on chrome-error after a bad nav).
+        logger.warning("Session markers not visible yet — reloading webshop home.")
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=self.nav_timeout)
+            self._wait_loaded(page, settle_s=1.5)
+            self._dismiss_cookie_banner(page)
+        except Exception as exc:
+            logger.warning("Reload failed: %s", exc)
+            self._safe_goto(self.base_url)
+            self._dismiss_cookie_banner(page)
+
+        reload_deadline = time.time() + 15
+        while time.time() < reload_deadline:
+            if self.is_signed_in():
+                logger.info("Active signed-in webshop session confirmed after reload.")
+                return
+            time.sleep(0.5)
+
+        raise RuntimeError(
+            "Webshop session is not active (impersonator not visible). "
+            "Run: python main.py --login  then complete sign-in / MFA, "
+            "and leave that Chrome window open. "
+            f"(current url={page.url!r})"
+        )
+
+    def keep_session_warm(self) -> None:
+        """Light navigation so the long-lived Chrome session stays alive."""
+        if self.page is None:
+            return
+        try:
+            self._safe_goto(self.base_url)
+            self._dismiss_cookie_banner(self.page)
+            if self.is_signed_in():
+                logger.debug("Session keepalive OK (still signed in).")
+            else:
+                logger.warning(
+                    "Session keepalive: not signed in. Run: python main.py --login"
+                )
+        except Exception as exc:
+            logger.warning("Session keepalive failed: %s", exc)
+
     def wait_until_impersonator_ready(self, timeout_ms: int = 600_000) -> None:
         """
         Block until the Find/Add user (impersonator) control is visible.
-        Use for a one-time manual login bootstrap; session stays in user_data_dir.
+        Use for a one-time manual login bootstrap; leave Chrome open afterward.
         """
         assert self.page is not None
-        toggle = self.page.locator('[data-testid="impersonator-toggle-button"]')
-        if toggle.count() > 0 and toggle.first.is_visible():
-            logger.info("Impersonator already visible — session is ready.")
-            return
+        toggle = self.page.locator(self._impersonator_toggle_selector()).first
+        try:
+            if toggle.count() > 0 and toggle.is_visible():
+                logger.info("Impersonator already visible — session is ready.")
+                return
+        except Exception:
+            pass
 
         logger.info(
             "Complete login manually in the Chrome window "
@@ -284,21 +514,51 @@ class WebshopBot:
             "Waiting up to %s min for impersonator (add user) button...",
             max(1, timeout_ms // 60_000),
         )
-        toggle.first.wait_for(state="visible", timeout=timeout_ms)
+        toggle.wait_for(state="visible", timeout=timeout_ms)
         logger.info(
-            "Impersonator visible — session saved in profile %s",
+            "Impersonator visible — active session ready on CDP port %s (profile %s)",
+            self._cdp_port,
             Path(self.user_data_dir).resolve(),
         )
+
+    def _safe_goto(self, url: str) -> None:
+        """Navigate without failing when Chrome races another same-URL load."""
+        assert self.page is not None
+        page = self.page
+        current = (page.url or "").rstrip("/").lower()
+        target = url.rstrip("/").lower()
+        if current == target:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10_000)
+            except PlaywrightTimeout:
+                pass
+            self._wait_loaded(page, settle_s=0.5)
+            return
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=self.nav_timeout)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "interrupted by another navigation" in msg:
+                logger.debug("Navigation race ignored: %s", exc)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                except PlaywrightTimeout:
+                    pass
+            else:
+                raise
+        self._wait_loaded(page, settle_s=1.0)
 
     def run_batch_order(
         self,
         client_number: str,
         client_name: str,
         batch_csvs: Sequence[str | Path],
+        *,
+        require_existing_session: bool = False,
     ) -> None:
         """
-        Login once, impersonate, then upload each batch CSV and add to cart.
-        Each file must already be <= batch_max_rows (typically 100).
+        Login once (or reuse active session), impersonate, then upload each
+        batch CSV and add to cart. Each file must already be <= batch_max_rows.
         """
         if not self.page:
             self.start()
@@ -311,27 +571,32 @@ class WebshopBot:
             if not csv_path.exists():
                 raise FileNotFoundError(f"Batch CSV not found: {csv_path}")
 
-        if not self.password:
-            raise ValueError(
-                "Webshop password missing. Set [webshop] password in webshop_config.ini."
+        if require_existing_session:
+            self.ensure_signed_in_session()
+            already_signed_in = True
+        else:
+            if not self.password:
+                raise ValueError(
+                    "Webshop password missing. Set [webshop] password in webshop_config.ini."
+                )
+
+            # Re-read password from config right before login (ignore stale values)
+            self.config = load_config()
+            self.username = self.config.get("webshop", "username")
+            self.password = webshop_password(self.config)
+            logger.info(
+                "Using webshop login %s (password from config, length=%s, ends_with=%s).",
+                self.username,
+                len(self.password),
+                self.password[-2:] if len(self.password) >= 2 else "?",
             )
 
-        # Re-read password from config right before login (ignore stale values)
-        self.config = load_config()
-        self.username = self.config.get("webshop", "username")
-        self.password = webshop_password(self.config)
-        logger.info(
-            "Using webshop login %s (password from config, length=%s, ends_with=%s).",
-            self.username,
-            len(self.password),
-            self.password[-2:] if len(self.password) >= 2 else "?",
-        )
+            already_signed_in = self._login()
+            if not already_signed_in:
+                # Passkey dialog appears after Log in -> Continue -> already in shop.
+                self._handle_passkey_continue()
+                self._handle_microsoft_auth()
 
-        already_signed_in = self._login()
-        if not already_signed_in:
-            # Passkey dialog appears after Log in -> Continue -> already in shop.
-            self._handle_passkey_continue()
-            self._handle_microsoft_auth()
         self._impersonate_user(client_number, client_name)
         self._open_batch_order()
 
@@ -421,19 +686,17 @@ class WebshopBot:
         page = self.page
 
         self._phase(f"Opening webshop as {self.username}")
-        page.goto(self.base_url, wait_until="domcontentloaded")
-        self._wait_loaded(page, settle_s=1.5)
+        self._safe_goto(self.base_url)
         self._dismiss_cookie_banner(page)
 
-        if page.locator('[data-testid="impersonator-toggle-button"]').count() > 0:
+        if self.is_signed_in():
             logger.info("Already signed in (Chrome profile session restored).")
             return True
 
         # Direct login URL avoids Sign-in click behind cookie overlay
         self._phase(f"Navigating to login for {self.username}")
         try:
-            page.goto(self.login_url, wait_until="domcontentloaded")
-            self._wait_loaded(page, settle_s=2.0)
+            self._safe_goto(self.login_url)
             self._dismiss_cookie_banner(page)
         except Exception as exc:
             logger.warning("Direct login URL failed (%s); clicking Sign in.", exc)
@@ -946,10 +1209,10 @@ try {{
         page = self.page
 
         self._phase(f"Finding user {client_number} {client_name}".strip())
-        toggle = page.locator('[data-testid="impersonator-toggle-button"]')
-        toggle.wait_for(state="visible")
-        toggle.click()
-        time.sleep(0.8)
+        # Always start from home — leftover impersonation / bad nav hides the toggle.
+        self._safe_goto(self.base_url)
+        self._open_impersonator_toggle()
+        time.sleep(0.3)
 
         search = page.locator(
             'input[data-testid="impersonator-user-search-input"], '
@@ -993,18 +1256,41 @@ try {{
             f"(last tried {last_query!r})."
         )
 
+    def _batch_order_url(self) -> str:
+        """Absolute Batch Order URL (relative paths fail under CDP)."""
+        base = self.base_url.rstrip("/")
+        if base.endswith("/en"):
+            return f"{base}/shop-by/batch/"
+        return f"{base}/en/shop-by/batch/"
+
     def _open_batch_order(self) -> None:
         assert self.page is not None
         page = self.page
 
         self._phase("Opening Batch Order")
+        batch_url = self._batch_order_url()
         link = page.locator(
             'a.l-s-header__link-site-nav[href*="/shop-by/batch"], '
             'a[href="/en/shop-by/batch/"], '
             'a:has-text("Batch Order")'
         ).first
-        link.wait_for(state="visible")
-        link.click()
+
+        # Nav link often exists but stays hidden (collapsed site menu).
+        try:
+            if link.count() > 0 and link.is_visible():
+                link.click()
+            else:
+                logger.info(
+                    "Batch Order nav link hidden; opening %s directly.",
+                    batch_url,
+                )
+                self._safe_goto(batch_url)
+        except Exception as exc:
+            logger.warning(
+                "Batch Order click failed (%s); navigating directly.", exc
+            )
+            self._safe_goto(batch_url)
+
         self._wait_loaded(page, settle_s=2.0)
         logger.info("Opened Batch Order page.")
 

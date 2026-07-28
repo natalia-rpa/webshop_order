@@ -49,6 +49,32 @@ def batch_max_rows(config: configparser.ConfigParser) -> int:
     return config.getint("webshop", "batch_max_rows", fallback=100)
 
 
+def unattended_poll_interval_sec(config: configparser.ConfigParser) -> int:
+    """Seconds between unattended sheet polls (default 60)."""
+    return config.getint("unattended", "poll_interval_sec", fallback=60)
+
+
+def unattended_headless(config: configparser.ConfigParser) -> bool:
+    """Whether unattended mode forces headless Chrome."""
+    return config.getboolean("unattended", "headless", fallback=False)
+
+
+def webshop_cdp_port(config: configparser.ConfigParser) -> int:
+    """Fixed Chrome remote-debugging port for --login / unattended session share."""
+    return config.getint("webshop", "cdp_port", fallback=9222)
+
+
+def alert_notify_emails(config: configparser.ConfigParser) -> List[str]:
+    """Recipients for session-restore alerts ([alerts] notify_emails)."""
+    raw = config.get("alerts", "notify_emails", fallback="")
+    emails: List[str] = []
+    for part in raw.replace(";", ",").split(","):
+        addr = part.strip()
+        if addr and "@" in addr:
+            emails.append(addr)
+    return emails
+
+
 def ensure_runtime_dirs(config: configparser.ConfigParser) -> None:
     Path(config.get("webshop", "downloads_dir")).mkdir(parents=True, exist_ok=True)
     Path(

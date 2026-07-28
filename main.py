@@ -7,20 +7,32 @@ process_emails():
   3. Extract client data + prepare A/B CSV batches (max 100 rows each)
   4. Playwright: login, impersonate, batch upload loop, add to cart
   5. Update ROBOT_PHASE (PROCESSING / ERROR / FINISHED)
+
+run_unattended():
+  Background loop — keeps one signed-in Chrome session alive, polls MAIN
+  every N seconds (default 60), processes when MANUAL_PHASE=VALID and
+  ROBOT_PHASE empty. If session is dead, run: python main.py --login
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Optional
 
 from auth import init_connections
-from config_loader import batch_max_rows, ensure_runtime_dirs, load_config
+from config_loader import (
+    batch_max_rows,
+    ensure_runtime_dirs,
+    load_config,
+    unattended_headless,
+    unattended_poll_interval_sec,
+)
 from csv_utils import prepare_batch_payload
+from email_notify import notify_session_inactive
 from logging_setup import get_logger, setup_logging
 from spreadsheet_processing import (
     OrderRow,
@@ -31,6 +43,23 @@ from spreadsheet_processing import (
 from webshop_bot import WebshopBot
 
 VERSION = "1.0.0"
+
+
+def _is_session_inactive_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "session is not active" in text
+        or "python main.py --login" in text
+        or "impersonator not visible" in text
+        or "impersonator (find/add user) control not available" in text
+    )
+
+
+def _alert_session_inactive(config, exc: BaseException) -> None:
+    try:
+        notify_session_inactive(config, detail=str(exc))
+    except Exception as mail_exc:
+        get_logger().error("Session-inactive alert email failed: %s", mail_exc)
 
 
 def _bootstrap_logging(config) -> Any:
@@ -48,6 +77,8 @@ def process_single_order(
     order: OrderRow,
     config,
     bot: Optional[WebshopBot] = None,
+    *,
+    require_existing_session: bool = False,
 ) -> bool:
     """
     Process one MAIN row end-to-end.
@@ -106,6 +137,7 @@ def process_single_order(
             client_number=order.client_number,
             client_name=order.client_name,
             batch_csvs=payload.batch_files,
+            require_existing_session=require_existing_session,
         )
 
         set_robot_phase(sheet, order.row_number, "FINISHED", "FINISHED", config)
@@ -114,6 +146,12 @@ def process_single_order(
 
     except Exception as exc:
         reason = str(exc).strip() or type(exc).__name__
+        # Session loss must stop unattended — do not mark a row ERROR forever.
+        if require_existing_session and (
+            "session is not active" in reason.lower()
+            or "python main.py --login" in reason
+        ):
+            raise
         logger.error("Error processing row %s: %s", order.row_number, reason)
         logger.error(traceback.format_exc())
         try:
@@ -127,7 +165,14 @@ def process_single_order(
             bot.stop()
 
 
-def process_emails(max_orders: Optional[int] = None) -> int:
+def process_emails(
+    max_orders: Optional[int] = None,
+    *,
+    force_headless: Optional[bool] = None,
+    quiet_when_idle: bool = False,
+    bot: Optional[WebshopBot] = None,
+    require_existing_session: bool = False,
+) -> int:
     """
     Main orchestration (Gmail + Sheets arrival, then order processing).
 
@@ -137,7 +182,11 @@ def process_emails(max_orders: Optional[int] = None) -> int:
     ensure_runtime_dirs(config)
     logger = _bootstrap_logging(config)
 
-    logger.info("======= Webshop Order Robot v%s =======", VERSION)
+    if force_headless is not None:
+        config.set("webshop", "headless", "true" if force_headless else "false")
+
+    if not quiet_when_idle:
+        logger.info("======= Webshop Order Robot v%s =======", VERSION)
     logger.info("Connecting to Google Sheets...")
 
     gmail_service, sheets_client, main_sheet = init_connections(config)
@@ -146,30 +195,125 @@ def process_emails(max_orders: Optional[int] = None) -> int:
 
     pending = find_pending_orders(main_sheet, config)
     if not pending:
-        logger.info("No rows ready (MANUAL_PHASE=VALID & ROBOT_PHASE empty).")
+        if quiet_when_idle:
+            logger.debug("No rows ready (MANUAL_PHASE=VALID & ROBOT_PHASE empty).")
+        else:
+            logger.info("No rows ready (MANUAL_PHASE=VALID & ROBOT_PHASE empty).")
         return 0
 
     if max_orders is not None:
         pending = pending[: max(0, max_orders)]
 
     success = 0
-    bot: Optional[WebshopBot] = None
+    owns_bot = bot is None
     try:
-        bot = WebshopBot(config=config)
-        bot.start()
+        if bot is None:
+            bot = WebshopBot(config=config)
+            bot.start()
 
         for order in pending:
             ok = process_single_order(
-                main_sheet, sheets_client, order, config, bot=bot
+                main_sheet,
+                sheets_client,
+                order,
+                config,
+                bot=bot,
+                require_existing_session=require_existing_session,
             )
             if ok:
                 success += 1
     finally:
-        if bot is not None:
+        if owns_bot and bot is not None:
             bot.stop()
 
     logger.info("Finished run: %s/%s order(s) succeeded.", success, len(pending))
     return success
+
+
+def run_unattended(max_orders: Optional[int] = None) -> int:
+    """
+    Background unattended loop with a long-lived signed-in Chrome session.
+
+    Chrome stays open for the whole run (attach to --login session when present).
+    Polls MAIN, processes rows already signed in — no password/MFA re-login.
+    If the session is not active, stop and run: python main.py --login
+    """
+    config = load_config()
+    ensure_runtime_dirs(config)
+    logger = _bootstrap_logging(config)
+
+    poll_sec = unattended_poll_interval_sec(config)
+    force_headless = unattended_headless(config)
+    config.set("webshop", "headless", "true" if force_headless else "false")
+
+    cdp_port = config.getint("webshop", "cdp_port", fallback=9222)
+    logger.info("======= Webshop Order Robot v%s — UNATTENDED =======", VERSION)
+    logger.info(
+        "Keeping one active webshop session (CDP %s). "
+        "Polling every %ss for MANUAL_PHASE=VALID & ROBOT_PHASE empty "
+        "(headless=%s).",
+        cdp_port,
+        poll_sec,
+        force_headless,
+    )
+
+    bot: Optional[WebshopBot] = None
+    try:
+        bot = WebshopBot(config=config)
+        bot.start()
+        try:
+            bot.ensure_signed_in_session()
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            if _is_session_inactive_error(exc):
+                _alert_session_inactive(config, exc)
+            bot.stop(keep_browser=True)
+            return 1
+
+        logger.info(
+            "Active session locked in. Leave this Chrome window open. "
+            "Orders will run without signing in again."
+        )
+
+        cycle = 0
+        while True:
+            cycle += 1
+            try:
+                logger.info("--- Unattended poll cycle %s ---", cycle)
+                process_emails(
+                    max_orders=max_orders,
+                    force_headless=force_headless,
+                    quiet_when_idle=True,
+                    bot=bot,
+                    require_existing_session=True,
+                )
+            except KeyboardInterrupt:
+                raise
+            except RuntimeError as exc:
+                logger.error("Unattended cycle %s: %s", cycle, exc)
+                if _is_session_inactive_error(exc):
+                    logger.error(
+                        "Stopping unattended until session is restored. "
+                        "Run: python main.py --login"
+                    )
+                    _alert_session_inactive(config, exc)
+                    return 1
+                logger.error(traceback.format_exc())
+            except Exception as exc:
+                logger.error("Unattended cycle %s failed: %s", cycle, exc)
+                logger.error(traceback.format_exc())
+                if _is_session_inactive_error(exc):
+                    _alert_session_inactive(config, exc)
+                    return 1
+
+            bot.keep_session_warm()
+            logger.info("Next poll in %ss (session stays active)...", poll_sec)
+            time.sleep(poll_sec)
+    finally:
+        if bot is not None:
+            # Leave Chrome signed-in for the next unattended / --login attach.
+            bot.stop(keep_browser=True)
+    return 0
 
 
 def check_required_files() -> bool:
@@ -188,12 +332,10 @@ def check_required_files() -> bool:
 
 def bootstrap_login(timeout_min: int = 10) -> int:
     """
-    Open REAL Chrome (not Playwright) with the bot profile only
-    (static/browser_profile) — never the user's default Profile 1.
+    Open / attach the bot Chrome profile and wait until the webshop session
+    is active (impersonator visible). Leaves Chrome running on the fixed CDP
+    port so unattended mode can reuse the signed-in session.
     """
-    import subprocess
-    import time
-
     config = load_config()
     ensure_runtime_dirs(config)
     logger = _bootstrap_logging(config)
@@ -203,107 +345,41 @@ def bootstrap_login(timeout_min: int = 10) -> int:
     ).resolve()
     profile.mkdir(parents=True, exist_ok=True)
     (profile / "Default").mkdir(parents=True, exist_ok=True)
-
-    # Make the window obviously the bot profile (not Chrome "Profile 1").
     _label_bot_chrome_profile(profile, display_name="Hiab Bot")
 
-    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
-        for path in (profile / name, profile / "Default" / name):
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
+    # Visible browser required for MFA / passkey.
+    config.set("webshop", "headless", "false")
+    cdp_port = config.getint("webshop", "cdp_port", fallback=9222)
 
-    base_url = config.get("webshop", "base_url")
-    chrome_candidates = [
-        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
-        / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
-        / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("LOCALAPPDATA", ""))
-        / "Google/Chrome/Application/chrome.exe",
-    ]
-    chrome_exe = next((p for p in chrome_candidates if p.is_file()), None)
-    if chrome_exe is None:
-        logger.error("chrome.exe not found. Install Google Chrome and retry.")
-        return 1
-
-    # Marker page so you can see this is NOT your personal Profile 1.
-    marker = profile / "hiab_bot_login.html"
-    marker.write_text(
-        "<!doctype html><meta charset=utf-8>"
-        "<title>Hiab Bot profile</title>"
-        "<body style='font-family:sans-serif;padding:2rem'>"
-        "<h1>Hiab Bot Chrome profile</h1>"
-        "<p>This is <b>not</b> your personal Profile 1.</p>"
-        f"<p>Profile path: <code>{profile}</code></p>"
-        f"<p><a href='{base_url}'>Open Hiab webshop</a></p>"
-        "</body>",
-        encoding="utf-8",
-    )
-    marker_url = marker.resolve().as_uri()
-
-    logger.info("======= Webshop login bootstrap v%s (real Chrome) =======", VERSION)
-    logger.info("Bot profile ONLY: %s", profile)
+    logger.info("======= Webshop login bootstrap v%s =======", VERSION)
+    logger.info("Bot profile: %s", profile)
+    logger.info("CDP port: %s (leave this Chrome open after login)", cdp_port)
     logger.info(
-        "Opening a separate Chrome instance labeled 'Hiab Bot'. "
-        "If you still see Profile 1, close personal Chrome and retry."
-    )
-    logger.info("Start page: %s", marker_url)
-
-    # Separate user-data-dir forces a second Chrome process (not Profile 1).
-    # Keep args before the URL; quote-safe absolute path.
-    creationflags = 0
-    if sys.platform == "win32":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-
-    subprocess.Popen(
-        [
-            str(chrome_exe),
-            f"--user-data-dir={profile}",
-            "--profile-directory=Default",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--new-window",
-            marker_url,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=creationflags,
-        close_fds=True,
+        "Sign in manually if prompted (passkey / MFA). "
+        "Waiting until the active webshop session is ready..."
     )
 
-    # Launcher chrome.exe often exits immediately after spawning the real
-    # browser process — wait until no Chrome still uses our user-data-dir.
-    time.sleep(2.0)
-    if not _chrome_using_user_data_dir(profile):
-        logger.error(
-            "Chrome did not start with bot profile %s. "
-            "Close all Chrome windows and run: python main.py --login",
-            profile,
+    bot = WebshopBot(config=config)
+    try:
+        bot.start()
+        bot.wait_until_impersonator_ready(timeout_ms=max(1, timeout_min) * 60_000)
+        logger.info(
+            "Active session ready. Keep this Chrome window open, then run:\n"
+            "  python main.py --unattended\n"
+            "or:\n"
+            "  python unattended_main.py"
         )
+        # Disconnect Playwright only — Chrome stays signed in.
+        bot.stop(keep_browser=True)
+        return 0
+    except Exception as exc:
+        logger.error("Login bootstrap failed: %s", exc)
+        logger.error(traceback.format_exc())
+        try:
+            bot.stop(keep_browser=True)
+        except Exception:
+            pass
         return 1
-
-    deadline = time.time() + max(1, timeout_min) * 60
-    logger.info(
-        "Waiting until you CLOSE the Hiab Bot Chrome window (up to %s min)...",
-        timeout_min,
-    )
-    while time.time() < deadline:
-        if not _chrome_using_user_data_dir(profile):
-            logger.info(
-                "Hiab Bot Chrome closed. Session is in %s. "
-                "Run the robot normally next (without --login).",
-                profile,
-            )
-            return 0
-        time.sleep(2.0)
-
-    logger.warning(
-        "Timeout waiting for Hiab Bot Chrome to close. "
-        "Close it manually when login is done."
-    )
-    return 1
 
 
 def _label_bot_chrome_profile(profile: Path, display_name: str = "Hiab Bot") -> None:
@@ -335,42 +411,13 @@ def _label_bot_chrome_profile(profile: Path, display_name: str = "Hiab Bot") -> 
             pass
 
 
-def _chrome_using_user_data_dir(user_data_dir: Path) -> bool:
-    """True if any chrome.exe process was started with this --user-data-dir."""
-    import subprocess
-
-    needle = str(user_data_dir).lower().replace("/", "\\")
-    try:
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" "
-                "| Select-Object -ExpandProperty CommandLine",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except Exception:
-        # Fallback: SingletonLock means a Chrome instance holds the profile.
-        return (user_data_dir / "SingletonLock").exists()
-
-    for line in (result.stdout or "").splitlines():
-        normalized = line.lower().replace("/", "\\")
-        if needle in normalized and "--user-data-dir" in normalized:
-            return True
-    return (user_data_dir / "SingletonLock").exists()
-
-
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(description="Hiab Webshop Order Robot")
     parser.add_argument(
         "--max",
         type=int,
         default=None,
-        help="Process at most N pending rows this run.",
+        help="Process at most N pending rows this run (or per unattended cycle).",
     )
     parser.add_argument(
         "--check",
@@ -380,13 +427,24 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument(
         "--login",
         action="store_true",
-        help="Open real Chrome (not Playwright) for one-time manual login into the bot profile.",
+        help=(
+            "Open/attach bot Chrome and wait until the webshop session is active. "
+            "Leave that window open for unattended mode."
+        ),
     )
     parser.add_argument(
         "--login-timeout-min",
         type=int,
         default=10,
         help="Minutes to wait for impersonator during --login (default: 10).",
+    )
+    parser.add_argument(
+        "--unattended",
+        action="store_true",
+        help=(
+            "Background mode: keep one signed-in Chrome session alive, poll MAIN "
+            "every poll_interval_sec (default 60s), process VALID rows without re-login."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -399,6 +457,8 @@ def main(argv: Optional[list] = None) -> int:
     try:
         if args.login:
             return bootstrap_login(timeout_min=args.login_timeout_min)
+        if args.unattended:
+            return run_unattended(max_orders=args.max)
         process_emails(max_orders=args.max)
         return 0
     except KeyboardInterrupt:

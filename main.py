@@ -102,6 +102,7 @@ def process_single_order(
         set_robot_phase(sheet, order.row_number, phase, detail, config)
 
     owns_bot = bot is None
+    batch_files: list[Path] = []
     try:
         set_timestamp_processed_at(sheet, order.row_number, config)
         set_robot_phase(sheet, order.row_number, "PROCESSING", "Extracting row data", config)
@@ -127,6 +128,7 @@ def process_single_order(
             stem=f"batch_{order.client_number}_{order.row_number}",
             batch_size=max_rows,
         )
+        batch_files = list(payload.batch_files)
         logger.info(
             "Order has %s item row(s) -> %s batch file(s).",
             payload.total_rows,
@@ -151,6 +153,7 @@ def process_single_order(
             "phases", "finished_manual", fallback="FINISHED"
         ).strip()
         set_manual_phase(sheet, order.row_number, finished_manual, config)
+        _delete_order_batch_csvs(batch_files, order.row_number)
         logger.info("Process completed successfully for row %s.", order.row_number)
         return True
 
@@ -167,6 +170,27 @@ def process_single_order(
     finally:
         if owns_bot and bot is not None:
             bot.stop()
+
+
+def _delete_order_batch_csvs(batch_files: list[Path], row_number: int) -> None:
+    """Remove download batch CSVs that belong to a finished order row."""
+    logger = get_logger()
+    for path in batch_files:
+        try:
+            if path.is_file():
+                path.unlink()
+                logger.info(
+                    "Deleted batch CSV for finished row %s: %s",
+                    row_number,
+                    path.name,
+                )
+        except OSError as exc:
+            logger.warning(
+                "Could not delete batch CSV %s for row %s: %s",
+                path,
+                row_number,
+                exc,
+            )
 
 
 def process_emails(

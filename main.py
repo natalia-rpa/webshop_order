@@ -3,16 +3,18 @@ Webshop Order Robot — entry point.
 
 process_emails():
   1. Gmail OAuth + Google Sheets init
-  2. Find MAIN rows: MANUAL_PHASE=VALID & ROBOT_PHASE empty
+  2. Find MAIN rows: MANUAL_PHASE=PROCESSING & ROBOT_PHASE empty
+     & ACTIVE_PHASE (COL G)=5_VALID
   3. Extract client data + prepare A/B CSV batches (max 100 rows each)
   4. Playwright: login, impersonate, batch upload loop, add to cart
-  5. Update ROBOT_PHASE (PROCESSING / ERROR / FINISHED)
+  5. Update ROBOT_PHASE (PROCESSING / ERROR / FINISHED);
+     on FINISHED also set MANUAL_PHASE=FINISHED
 
 run_unattended():
   Background loop — Chrome runs hidden (logs only), polls MAIN every N
-  seconds (default 60), processes when MANUAL_PHASE=VALID and ROBOT_PHASE
-  empty. Reuses the signed-in bot profile. If session is dead, run:
-  python main.py --login
+  seconds (default 60), processes when MANUAL_PHASE=PROCESSING,
+  ROBOT_PHASE empty, and ACTIVE_PHASE=5_VALID. Reuses the signed-in bot
+  profile. If session is dead, run: python main.py --login
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ from spreadsheet_processing import (
     OrderRow,
     extract_order_payload,
     find_pending_orders,
+    set_manual_phase,
     set_robot_phase,
     set_timestamp_processed_at,
 )
@@ -144,6 +147,10 @@ def process_single_order(
         )
 
         set_robot_phase(sheet, order.row_number, "FINISHED", "FINISHED", config)
+        finished_manual = config.get(
+            "phases", "finished_manual", fallback="FINISHED"
+        ).strip()
+        set_manual_phase(sheet, order.row_number, finished_manual, config)
         logger.info("Process completed successfully for row %s.", order.row_number)
         return True
 
@@ -193,9 +200,15 @@ def process_emails(
     pending = find_pending_orders(main_sheet, config)
     if not pending:
         if quiet_when_idle:
-            logger.debug("No rows ready (MANUAL_PHASE=VALID & ROBOT_PHASE empty).")
+            logger.debug(
+                "No rows ready "
+                "(MANUAL_PHASE=PROCESSING & ROBOT_PHASE empty & ACTIVE_PHASE=5_VALID)."
+            )
         else:
-            logger.info("No rows ready (MANUAL_PHASE=VALID & ROBOT_PHASE empty).")
+            logger.info(
+                "No rows ready "
+                "(MANUAL_PHASE=PROCESSING & ROBOT_PHASE empty & ACTIVE_PHASE=5_VALID)."
+            )
         return 0
 
     if max_orders is not None:
@@ -233,7 +246,7 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
 
     Runs Chrome hidden (headless) — only logs are visible. Reuses the signed-in
     bot profile from --login (no password/MFA re-login). Polls MAIN for rows
-    with MANUAL_PHASE=VALID and ROBOT_PHASE empty.
+    with MANUAL_PHASE=PROCESSING, ROBOT_PHASE empty, and ACTIVE_PHASE=5_VALID.
     If the session is not active, stop and run: python main.py --login
     """
     config = load_config()
@@ -248,8 +261,8 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
     logger.info("======= Webshop Order Robot v%s — UNATTENDED =======", VERSION)
     logger.info(
         "Hidden Chrome session (CDP %s, headless=%s). "
-        "Polling every %ss for MANUAL_PHASE=VALID & ROBOT_PHASE empty. "
-        "Only logs are shown.",
+        "Polling every %ss for MANUAL_PHASE=PROCESSING & ROBOT_PHASE empty "
+        "& ACTIVE_PHASE=5_VALID. Only logs are shown.",
         cdp_port,
         force_headless,
         poll_sec,
@@ -443,7 +456,7 @@ def main(argv: Optional[list] = None) -> int:
         help=(
             "Hidden background mode: run Chrome headless (logs only), keep the "
             "signed-in session alive, poll MAIN every poll_interval_sec "
-            "(default 60s), process VALID rows without re-login."
+            "(default 60s), process PROCESSING+5_VALID rows without re-login."
         ),
     )
     args = parser.parse_args(argv)

@@ -533,7 +533,7 @@ class WebshopBot:
     def ensure_signed_in_session(self, wait_ms: int = 30_000) -> None:
         """
         Confirm the shared Chrome session is signed in.
-        Waits for the header to settle — do not treat a slow render as logged out.
+        If the session is over, try Login with SSO to restore it.
         """
         assert self.page is not None
         page = self.page
@@ -548,7 +548,7 @@ class WebshopBot:
                 return
             time.sleep(0.5)
 
-        # One hard refresh before giving up (page may be on chrome-error after a bad nav).
+        # One hard refresh before treating as expired (slow render / chrome-error).
         logger.warning("Session markers not visible yet — reloading webshop home.")
         try:
             page.reload(wait_until="domcontentloaded", timeout=self.nav_timeout)
@@ -566,11 +566,30 @@ class WebshopBot:
                 return
             time.sleep(0.5)
 
+        logger.warning("Webshop session is over — trying Login with SSO.")
+        self._restore_session_via_sso()
+
+    def _restore_session_via_sso(self) -> None:
+        """Session expired: Login with SSO, then leftover auth prompts if needed."""
+        already_signed_in = self._login()
+        if not already_signed_in:
+            self._handle_passkey_continue()
+            self._handle_microsoft_auth()
+
+        assert self.page is not None
+        if not self.is_signed_in():
+            self._safe_goto(self.base_url)
+            self._dismiss_cookie_banner(self.page)
+
+        if self.is_signed_in():
+            logger.info("Session restored via Login with SSO.")
+            return
+
         raise RuntimeError(
-            "Webshop session is not active (impersonator not visible). "
+            "Webshop session is not active after Login with SSO "
+            "(impersonator not visible). "
             "Run: python main.py --login  then complete sign-in / MFA. "
-            "Unattended will reuse that profile with Chrome hidden. "
-            f"(current url={page.url!r})"
+            f"(current url={self.page.url!r})"
         )
 
     def keep_session_warm(self) -> None:
@@ -584,8 +603,9 @@ class WebshopBot:
                 logger.debug("Session keepalive OK (still signed in).")
             else:
                 logger.warning(
-                    "Session keepalive: not signed in. Run: python main.py --login"
+                    "Session keepalive: session over — trying Login with SSO."
                 )
+                self._restore_session_via_sso()
         except Exception as exc:
             logger.warning("Session keepalive failed: %s", exc)
 
@@ -652,8 +672,9 @@ class WebshopBot:
         require_existing_session: bool = False,
     ) -> None:
         """
-        Login once (or reuse active session), impersonate, then upload each
-        batch CSV and add to cart. Each file must already be <= batch_max_rows.
+        Reuse active session when signed in; if session is over, Login with SSO.
+        Then impersonate, upload each batch CSV and add to cart.
+        Each file must already be <= batch_max_rows.
         """
         if not self.page:
             self.start()
@@ -666,31 +687,18 @@ class WebshopBot:
             if not csv_path.exists():
                 raise FileNotFoundError(f"Batch CSV not found: {csv_path}")
 
+        # Active session → continue. Session over → Login with SSO.
         if require_existing_session:
+            # Wait for header settle / reload, then SSO if still expired.
             self.ensure_signed_in_session()
-            already_signed_in = True
         else:
-            if not self.password:
-                raise ValueError(
-                    "Webshop password missing. Set [webshop] password in webshop_config.ini."
-                )
-
-            # Re-read password from config right before login (ignore stale values)
-            self.config = load_config()
-            self.username = self.config.get("webshop", "username")
-            self.password = webshop_password(self.config)
-            logger.info(
-                "Using webshop login %s (password from config, length=%s, ends_with=%s).",
-                self.username,
-                len(self.password),
-                self.password[-2:] if len(self.password) >= 2 else "?",
-            )
-
-            already_signed_in = self._login()
-            if not already_signed_in:
-                # SSO usually lands already in shop; only handle leftover prompts.
-                self._handle_passkey_continue()
-                self._handle_microsoft_auth()
+            self._safe_goto(self.base_url)
+            self._dismiss_cookie_banner(self.page)
+            if self.is_signed_in():
+                logger.info("Active session OK — skipping login.")
+            else:
+                logger.warning("Session is over — trying Login with SSO.")
+                self._restore_session_via_sso()
 
         self._impersonate_user(client_number, client_name)
         self._open_batch_order()

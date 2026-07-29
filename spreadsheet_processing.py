@@ -117,6 +117,26 @@ def set_robot_phase(
     logger.info("ROBOT_PHASE row %s -> %s", row_number, text)
 
 
+def set_manual_phase(
+    sheet: gspread.Worksheet,
+    row_number: int,
+    phase: str,
+    config=None,
+) -> None:
+    """
+    Write MANUAL_PHASE to an exact dropdown value (e.g. FINISHED).
+    """
+    config = config or load_config()
+    headers = sheet.row_values(1)
+    header_map = build_header_map(headers)
+    col_name = config.get("columns", "manual_phase")
+    col_idx = resolve_column(header_map, col_name) + 1  # 1-based for update_cell
+
+    text = phase.strip()
+    safe_update_cell(sheet, row_number, col_idx, text)
+    logger.info("MANUAL_PHASE row %s -> %s", row_number, text)
+
+
 def set_timestamp_processed_at(
     sheet: gspread.Worksheet,
     row_number: int,
@@ -155,10 +175,12 @@ def find_pending_orders(
     config=None,
 ) -> List[OrderRow]:
     """
-    Start condition: MANUAL_PHASE == VALID and ROBOT_PHASE empty.
+    Start condition: MANUAL_PHASE == PROCESSING, ROBOT_PHASE empty,
+    and ACTIVE_PHASE (col G) == 5_VALID.
     """
     config = config or load_config()
     start_manual = config.get("phases", "start_manual").strip().upper()
+    start_active = config.get("phases", "start_active", fallback="5_VALID").strip().upper()
     cols = config["columns"]
 
     values = sheet.get_all_values()
@@ -175,6 +197,16 @@ def find_pending_orders(
     idx_attachments = resolve_column(header_map, cols.get("attachments_path"))
     idx_manual = resolve_column(header_map, cols.get("manual_phase"))
     idx_robot = resolve_column(header_map, cols.get("robot_phase"))
+    active_col_name = cols.get("active_phase", "ACTIVE_PHASE")
+    try:
+        idx_active = resolve_column(header_map, active_col_name)
+    except KeyError:
+        # Column G fallback when header is missing / renamed.
+        idx_active = 6
+        logger.warning(
+            "Column %r not in headers; reading ACTIVE_PHASE from column G.",
+            active_col_name,
+        )
 
     pending: List[OrderRow] = []
     for row_offset, row in enumerate(values[1:], start=2):
@@ -183,7 +215,12 @@ def find_pending_orders(
 
         manual = cell(idx_manual)
         robot = cell(idx_robot)
-        if manual.upper() != start_manual or not _is_empty(robot):
+        active = cell(idx_active)
+        if (
+            manual.upper() != start_manual
+            or not _is_empty(robot)
+            or active.upper() != start_active
+        ):
             continue
 
         order = OrderRow(
@@ -198,9 +235,11 @@ def find_pending_orders(
         pending.append(order)
 
     logger.info(
-        "Found %s pending order row(s) (MANUAL_PHASE=%s, ROBOT_PHASE empty).",
+        "Found %s pending order row(s) "
+        "(MANUAL_PHASE=%s, ROBOT_PHASE empty, ACTIVE_PHASE=%s).",
         len(pending),
         start_manual,
+        start_active,
     )
     return pending
 

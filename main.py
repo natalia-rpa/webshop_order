@@ -353,7 +353,7 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
 
 def check_required_files() -> bool:
     required = [
-        "static/config/webshop_config.ini",
+        "static/secrets/webshop_config.ini",
         "static/secrets/oauth-keys.json",
     ]
     missing = [p for p in required if not Path(p).exists()]

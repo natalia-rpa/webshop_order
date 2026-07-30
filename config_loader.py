@@ -6,7 +6,7 @@ import configparser
 from pathlib import Path
 from typing import List
 
-CONFIG_PATH = Path("static/config/webshop_config.ini")
+CONFIG_PATH = Path("static/secrets/webshop_config.ini")
 
 
 def load_config(path: str | Path = CONFIG_PATH) -> configparser.ConfigParser:

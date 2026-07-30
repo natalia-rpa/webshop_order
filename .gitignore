@@ -4,11 +4,11 @@ __pycache__/
 *.pyo
 .env
 static/browser_profile/.gitkeep
-static/config/webshop_config.ini
 static/downloads/.gitkeep
 static/logs/.gitkeep
 static/secrets/*.json
 static/secrets/*.pickle
+static/secrets/webshop_config.ini
 static/logs/*.log
 static/downloads/*
 !static/downloads/.gitkeep

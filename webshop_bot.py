@@ -1329,38 +1329,51 @@ try {{
         ).first
         search.wait_for(state="visible")
 
-        # Prefer client_number alone — full "number + name" often returns no hits.
-        queries: List[str] = []
-        if client_number:
-            queries.append(client_number.strip())
-        full = " ".join(part for part in (client_number, client_name) if part).strip()
-        if full and full not in queries:
-            queries.append(full)
+        number = (client_number or "").strip()
+        name = (client_name or "").strip()
+        if not number or not name:
+            raise ValueError(
+                "client_number and client_name are both required for impersonation."
+            )
 
-        option = page.locator(
+        # Search with number + name; pick the option where both values match.
+        query = f"{number} {name}"
+        options = page.locator(
             "[id^='downshift-'][id*='-item-'], "
             '[role="option"], .c-impersonator__menu-item, li[id*="item"]'
-        ).first
+        )
 
-        last_query = ""
-        for query in queries:
-            last_query = query
-            search.click()
-            search.fill("")
-            search.type(query, delay=40)
-            logger.info("Entered impersonator search: %s", query)
+        search.click()
+        search.fill("")
+        search.type(query, delay=40)
+        logger.info("Entered impersonator search: %s", query)
+
+        try:
+            options.first.wait_for(state="visible", timeout=12000)
+        except PlaywrightTimeout as exc:
+            raise TimeoutError(
+                f"No impersonator results for query {query!r}."
+            ) from exc
+
+        number_l = number.casefold()
+        name_l = name.casefold()
+        count = options.count()
+        for index in range(count):
+            option = options.nth(index)
             try:
-                option.wait_for(state="visible", timeout=12000)
+                text = (option.inner_text(timeout=2000) or "").strip()
+            except PlaywrightTimeout:
+                continue
+            text_l = text.casefold()
+            if number_l in text_l and name_l in text_l:
                 option.click()
                 self._wait_loaded(page, settle_s=2.0)
-                logger.info("Selected impersonated user from list.")
+                logger.info("Selected impersonated user matching both values: %s", text)
                 return
-            except PlaywrightTimeout:
-                logger.warning("No impersonator results for %r; trying next query.", query)
 
         raise TimeoutError(
-            f"No impersonator user found for queries {queries!r} "
-            f"(last tried {last_query!r})."
+            f"No impersonator option matched both client_number={number!r} "
+            f"and client_name={name!r} (query {query!r}, {count} result(s))."
         )
 
     def _batch_order_url(self) -> str:

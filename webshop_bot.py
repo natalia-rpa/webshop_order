@@ -1329,12 +1329,13 @@ try {{
         ).first
         search.wait_for(state="visible")
 
-        number = (client_number or "").strip()
-        name = (client_name or "").strip()
-        if not number or not name:
-            raise ValueError(
-                "client_number and client_name are both required for impersonation."
-            )
+        # Prefer client_number alone — full "number + name" often returns no hits.
+        queries: List[str] = []
+        if client_number:
+            queries.append(client_number.strip())
+        full = " ".join(part for part in (client_number, client_name) if part).strip()
+        if full and full not in queries:
+            queries.append(full)
 
         # Search with number + name; pick the option where both values match.
         query = f"{number} {name}"
@@ -1342,7 +1343,7 @@ try {{
             "[id^='downshift-'][id*='-item-'], "
             '[role="option"], .c-impersonator__menu-item, li[id*="item"]'
         )
-
+        
         search.click()
         search.fill("")
         search.type(query, delay=40)

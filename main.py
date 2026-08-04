@@ -99,13 +99,38 @@ def process_single_order(
     )
 
     def on_phase(phase: str, detail: str) -> None:
-        set_robot_phase(sheet, order.row_number, phase, detail, config)
+        order.row_number = set_robot_phase(
+            sheet,
+            phase,
+            detail,
+            config,
+            email_id=order.email_id,
+            row_number=order.row_number,
+        )
 
     owns_bot = bot is None
     batch_files: list[Path] = []
     try:
-        set_timestamp_processed_at(sheet, order.row_number, config)
-        set_robot_phase(sheet, order.row_number, "PROCESSING", "Extracting row data", config)
+        if not order.email_id:
+            raise ValueError(
+                "email_id is empty on processing row; "
+                "cannot safely edit MANUAL_PHASE/ROBOT_PHASE after sheet inserts."
+            )
+
+        _, order.row_number = set_timestamp_processed_at(
+            sheet,
+            config,
+            email_id=order.email_id,
+            row_number=order.row_number,
+        )
+        order.row_number = set_robot_phase(
+            sheet,
+            "PROCESSING",
+            "Extracting row data",
+            config,
+            email_id=order.email_id,
+            row_number=order.row_number,
+        )
 
         if not order.client_number:
             raise ValueError("client_number is empty on processing row.")
@@ -115,17 +140,18 @@ def process_single_order(
         _, source_csv = extract_order_payload(sheet, order, sheets_client, config)
 
         max_rows = batch_max_rows(config)
-        set_robot_phase(
+        order.row_number = set_robot_phase(
             sheet,
-            order.row_number,
             "PROCESSING",
             f"Preparing A/B CSV batches (max {max_rows} rows)",
             config,
+            email_id=order.email_id,
+            row_number=order.row_number,
         )
         payload = prepare_batch_payload(
             source_csv,
             config.get("paths", "batch_csv_dir"),
-            stem=f"batch_{order.client_number}_{order.row_number}",
+            stem=f"batch_{order.client_number}_{order.email_id or order.row_number}",
             batch_size=max_rows,
         )
         batch_files = list(payload.batch_files)
@@ -148,21 +174,50 @@ def process_single_order(
             require_existing_session=require_existing_session,
         )
 
-        set_robot_phase(sheet, order.row_number, "FINISHED", "FINISHED", config)
+        order.row_number = set_robot_phase(
+            sheet,
+            "FINISHED",
+            "FINISHED",
+            config,
+            email_id=order.email_id,
+            row_number=order.row_number,
+        )
         finished_manual = config.get(
             "phases", "finished_manual", fallback="FINISHED"
         ).strip()
-        set_manual_phase(sheet, order.row_number, finished_manual, config)
+        order.row_number = set_manual_phase(
+            sheet,
+            finished_manual,
+            config,
+            email_id=order.email_id,
+            row_number=order.row_number,
+        )
         _delete_order_batch_csvs(batch_files, order.row_number)
-        logger.info("Process completed successfully for row %s.", order.row_number)
+        logger.info(
+            "Process completed successfully for email_id=%s row %s.",
+            order.email_id,
+            order.row_number,
+        )
         return True
 
     except Exception as exc:
         reason = str(exc).strip() or type(exc).__name__
-        logger.error("Error processing row %s: %s", order.row_number, reason)
+        logger.error(
+            "Error processing email_id=%s row %s: %s",
+            order.email_id,
+            order.row_number,
+            reason,
+        )
         logger.error(traceback.format_exc())
         try:
-            set_robot_phase(sheet, order.row_number, "ERROR", reason, config)
+            order.row_number = set_robot_phase(
+                sheet,
+                "ERROR",
+                reason,
+                config,
+                email_id=order.email_id,
+                row_number=order.row_number,
+            )
         except Exception as sheet_exc:
             logger.error("Failed to write ERROR phase: %s", sheet_exc)
         return False

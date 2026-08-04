@@ -22,10 +22,10 @@ logger = get_logger()
 
 @dataclass
 class OrderRow:
-    row_number: int  # 1-based sheet row
+    row_number: int  # 1-based sheet row at discovery; may shift when new emails insert
     client_number: str
     client_name: str
-    email_id: str
+    email_id: str  # stable key — re-resolve row before phase/timestamp edits
     attachments_path: str
     manual_phase: str
     robot_phase: str
@@ -88,18 +88,90 @@ def safe_update_cell(
             raise
 
 
+def find_row_by_email_id(
+    sheet: gspread.Worksheet,
+    email_id: str,
+    config=None,
+    *,
+    known_row: Optional[int] = None,
+) -> int:
+    """
+    Locate the current 1-based sheet row for email_id.
+
+    New inbound emails insert rows and shift existing ones down, so a
+    previously captured row_number can point at the wrong order. Always
+    re-resolve by email_id before writing MANUAL_PHASE / ROBOT_PHASE /
+    TIMESTAMP_PROCESSED_AT.
+    """
+    email_id = (email_id or "").strip()
+    if not email_id:
+        raise ValueError("email_id is required to locate the sheet row to edit.")
+
+    config = config or load_config()
+    col_name = config.get("columns", "email_id")
+    values = sheet.get_all_values()
+    if not values:
+        raise LookupError(f"MAIN sheet is empty; cannot find email_id={email_id!r}.")
+
+    headers = values[0]
+    header_map = build_header_map(headers)
+    idx_email = resolve_column(header_map, col_name)
+
+    for row_offset, row in enumerate(values[1:], start=2):
+        cell = row[idx_email].strip() if idx_email < len(row) else ""
+        if cell == email_id:
+            if known_row is not None and known_row != row_offset:
+                logger.info(
+                    "Row for email_id=%s moved %s -> %s (sheet shifted; editing current row).",
+                    email_id,
+                    known_row,
+                    row_offset,
+                )
+            return row_offset
+
+    raise LookupError(
+        f"No MAIN row found for email_id={email_id!r} "
+        f"(known_row={known_row!r}). Cannot safely edit phase/timestamp."
+    )
+
+
+def _resolve_edit_row(
+    sheet: gspread.Worksheet,
+    email_id: Optional[str],
+    row_number: Optional[int],
+    config=None,
+) -> int:
+    """Prefer email_id lookup; fall back to row_number only if email_id missing."""
+    if email_id and str(email_id).strip():
+        return find_row_by_email_id(
+            sheet, email_id, config, known_row=row_number
+        )
+    if row_number is None:
+        raise ValueError("Either email_id or row_number is required to edit the sheet.")
+    logger.warning(
+        "Editing sheet row %s without email_id — unsafe if new emails insert rows.",
+        row_number,
+    )
+    return row_number
+
+
 def set_robot_phase(
     sheet: gspread.Worksheet,
-    row_number: int,
     phase: str,
     detail: str = "",
     config=None,
-) -> None:
+    *,
+    email_id: Optional[str] = None,
+    row_number: Optional[int] = None,
+) -> int:
     """
     Write ROBOT_PHASE as 'PHASE' or 'PHASE - detail'.
+    Locates the target by email_id (preferred) so inserts cannot retarget the write.
     Examples: PROCESSING - Logging in | ERROR - Missing CSV | FINISHED
+    Returns the 1-based row that was updated.
     """
     config = config or load_config()
+    row = _resolve_edit_row(sheet, email_id, row_number, config)
     headers = sheet.row_values(1)
     header_map = build_header_map(headers)
     col_name = config.get("columns", "robot_phase")
@@ -113,42 +185,62 @@ def set_robot_phase(
     elif phase.upper() == "FINISHED":
         text = "FINISHED"
 
-    safe_update_cell(sheet, row_number, col_idx, text)
-    logger.info("ROBOT_PHASE row %s -> %s", row_number, text)
+    safe_update_cell(sheet, row, col_idx, text)
+    logger.info(
+        "ROBOT_PHASE email_id=%s row %s -> %s",
+        email_id or "(none)",
+        row,
+        text,
+    )
+    return row
 
 
 def set_manual_phase(
     sheet: gspread.Worksheet,
-    row_number: int,
     phase: str,
     config=None,
-) -> None:
+    *,
+    email_id: Optional[str] = None,
+    row_number: Optional[int] = None,
+) -> int:
     """
     Write MANUAL_PHASE to an exact dropdown value (e.g. FINISHED).
+    Locates the target by email_id (preferred) so inserts cannot retarget the write.
+    Returns the 1-based row that was updated.
     """
     config = config or load_config()
+    row = _resolve_edit_row(sheet, email_id, row_number, config)
     headers = sheet.row_values(1)
     header_map = build_header_map(headers)
     col_name = config.get("columns", "manual_phase")
     col_idx = resolve_column(header_map, col_name) + 1  # 1-based for update_cell
 
     text = phase.strip()
-    safe_update_cell(sheet, row_number, col_idx, text)
-    logger.info("MANUAL_PHASE row %s -> %s", row_number, text)
+    safe_update_cell(sheet, row, col_idx, text)
+    logger.info(
+        "MANUAL_PHASE email_id=%s row %s -> %s",
+        email_id or "(none)",
+        row,
+        text,
+    )
+    return row
 
 
 def set_timestamp_processed_at(
     sheet: gspread.Worksheet,
-    row_number: int,
     config=None,
     *,
+    email_id: Optional[str] = None,
+    row_number: Optional[int] = None,
     when: Optional[datetime] = None,
-) -> str:
+) -> Tuple[str, int]:
     """
     Write TIMESTAMP_PROCESSED_AT (column K) when a row starts processing.
-    Returns the timestamp string written to the sheet.
+    Locates the target by email_id (preferred) so inserts cannot retarget the write.
+    Returns (timestamp string written, 1-based row updated).
     """
     config = config or load_config()
+    row = _resolve_edit_row(sheet, email_id, row_number, config)
     stamp = (when or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     headers = sheet.row_values(1)
     header_map = build_header_map(headers)
@@ -165,9 +257,14 @@ def set_timestamp_processed_at(
             col_name,
         )
 
-    safe_update_cell(sheet, row_number, col_idx, stamp)
-    logger.info("TIMESTAMP_PROCESSED_AT row %s -> %s", row_number, stamp)
-    return stamp
+    safe_update_cell(sheet, row, col_idx, stamp)
+    logger.info(
+        "TIMESTAMP_PROCESSED_AT email_id=%s row %s -> %s",
+        email_id or "(none)",
+        row,
+        stamp,
+    )
+    return stamp, row
 
 
 def find_pending_orders(
@@ -485,8 +582,13 @@ def extract_order_payload(
     """Download / export attachment CSV for the order row and return path."""
     config = config or load_config()
     downloads = config.get("webshop", "downloads_dir")
-    set_robot_phase(
-        sheet, order.row_number, "PROCESSING", "Downloading attachment CSV", config
+    order.row_number = set_robot_phase(
+        sheet,
+        "PROCESSING",
+        "Downloading attachment CSV",
+        config,
+        email_id=order.email_id,
+        row_number=order.row_number,
     )
     path = download_attachment(
         order.attachments_path,

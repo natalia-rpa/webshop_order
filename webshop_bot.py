@@ -1329,52 +1329,60 @@ try {{
         ).first
         search.wait_for(state="visible")
 
-        # Prefer client_number alone — full "number + name" often returns no hits.
+        # Prefer full "number + name"; fall back to client_number alone.
         queries: List[str] = []
-        if client_number:
-            queries.append(client_number.strip())
         full = " ".join(part for part in (client_number, client_name) if part).strip()
-        if full and full not in queries:
+        if full:
             queries.append(full)
+        if client_number:
+            number_only = client_number.strip()
+            if number_only and number_only not in queries:
+                queries.append(number_only)
+        if not queries:
+            raise ValueError("client_number and client_name are both empty.")
 
-        # Search with number + name; pick the option where both values match.
-        query = f"{number} {name}"
         options = page.locator(
             "[id^='downshift-'][id*='-item-'], "
             '[role="option"], .c-impersonator__menu-item, li[id*="item"]'
         )
-        
-        search.click()
-        search.fill("")
-        search.type(query, delay=40)
-        logger.info("Entered impersonator search: %s", query)
+        number_l = (client_number or "").casefold()
+        name_l = (client_name or "").casefold()
+        last_query = ""
+        last_count = 0
 
-        try:
-            options.first.wait_for(state="visible", timeout=12000)
-        except PlaywrightTimeout as exc:
-            raise TimeoutError(
-                f"No impersonator results for query {query!r}."
-            ) from exc
+        for query in queries:
+            last_query = query
+            search.click()
+            search.fill("")
+            search.type(query, delay=40)
+            logger.info("Entered impersonator search: %s", query)
 
-        number_l = number.casefold()
-        name_l = name.casefold()
-        count = options.count()
-        for index in range(count):
-            option = options.nth(index)
             try:
-                text = (option.inner_text(timeout=2000) or "").strip()
+                options.first.wait_for(state="visible", timeout=12000)
             except PlaywrightTimeout:
+                logger.info("No impersonator results for query %r; trying next.", query)
                 continue
-            text_l = text.casefold()
-            if number_l in text_l and name_l in text_l:
-                option.click()
-                self._wait_loaded(page, settle_s=2.0)
-                logger.info("Selected impersonated user matching both values: %s", text)
-                return
+
+            last_count = options.count()
+            for index in range(last_count):
+                option = options.nth(index)
+                try:
+                    text = (option.inner_text(timeout=2000) or "").strip()
+                except PlaywrightTimeout:
+                    continue
+                text_l = text.casefold()
+                number_ok = (not number_l) or (number_l in text_l)
+                name_ok = (not name_l) or (name_l in text_l)
+                if number_ok and name_ok:
+                    option.click()
+                    self._wait_loaded(page, settle_s=2.0)
+                    logger.info("Selected impersonated user: %s", text)
+                    return
 
         raise TimeoutError(
-            f"No impersonator option matched both client_number={number!r} "
-            f"and client_name={name!r} (query {query!r}, {count} result(s))."
+            f"No impersonator option matched client_number={client_number!r} "
+            f"and client_name={client_name!r} "
+            f"(last query {last_query!r}, {last_count} result(s))."
         )
 
     def _batch_order_url(self) -> str:

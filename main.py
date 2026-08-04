@@ -8,7 +8,7 @@ process_emails():
   3. Extract client data + prepare A/B CSV batches (max 100 rows each)
   4. Playwright: login, impersonate, batch upload loop, add to cart
   5. Update ROBOT_PHASE (PROCESSING / ERROR / FINISHED);
-     on FINISHED also set MANUAL_PHASE=FINISHED
+     on FINISHED set MANUAL_PHASE=FINISHED; on ERROR set MANUAL_PHASE=ERROR
 
 run_unattended():
   Background loop — Chrome runs hidden (logs only), polls MAIN every N
@@ -214,6 +214,16 @@ def process_single_order(
                 sheet,
                 "ERROR",
                 reason,
+                config,
+                email_id=order.email_id,
+                row_number=order.row_number,
+            )
+            error_manual = config.get(
+                "phases", "error_manual", fallback="ERROR"
+            ).strip()
+            order.row_number = set_manual_phase(
+                sheet,
+                error_manual,
                 config,
                 email_id=order.email_id,
                 row_number=order.row_number,

@@ -2,7 +2,7 @@
 Webshop Order Robot — entry point.
 
 process_emails():
-  1. Gmail OAuth + Google Sheets init
+  1. Google Sheets init
   2. Find MAIN rows: MANUAL_PHASE=PROCESSING & ROBOT_PHASE empty
      & ACTIVE_PHASE (COL G)=5_VALID
   3. Extract client data + prepare A/B CSV batches (max 100 rows each)
@@ -267,7 +267,7 @@ def process_emails(
     require_existing_session: bool = False,
 ) -> int:
     """
-    Main orchestration (Gmail + Sheets arrival, then order processing).
+    Main orchestration (Sheets arrival, then order processing).
 
     Returns number of successfully finished orders.
     """
@@ -282,8 +282,7 @@ def process_emails(
         logger.info("======= Webshop Order Robot v%s =======", VERSION)
     logger.info("Connecting to Google Sheets...")
 
-    gmail_service, sheets_client, main_sheet = init_connections(config)
-    _ = gmail_service
+    sheets_client, main_sheet = init_connections(config)
     logger.info("Sheets connection ready.")
 
     pending = find_pending_orders(main_sheet, config)

@@ -154,21 +154,3 @@ def prepare_batch_payload(
         total_rows=len(items),
         batch_size=batch_size,
     )
-
-
-# Backwards-compatible single-file helper (no split).
-def extract_columns_ab(
-    source_csv: Union[str, Path],
-    output_dir: Union[str, Path],
-    output_name: str | None = None,
-) -> Path:
-    source = Path(source_csv)
-    items = load_items_dataframe(source)
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    name = output_name or f"{source.stem}_ab.csv"
-    target = out_dir / name
-    out = items.rename(columns={"item": ITEM_HEADER, "qty": QTY_HEADER})
-    out.to_csv(target, index=False, header=True)
-    logger.info("Prepared batch CSV with columns A/B: %s (%s rows).", target, len(items))
-    return target

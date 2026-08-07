@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -68,12 +68,9 @@ def open_main_sheet(client: gspread.Client, config=None) -> gspread.Worksheet:
 
 def init_connections(
     config=None,
-) -> Tuple[Optional[Any], gspread.Client, gspread.Worksheet]:
-    """
-    Sheets arrival & initialization.
-    Gmail is not used yet (returns None).
-    """
+) -> Tuple[gspread.Client, gspread.Worksheet]:
+    """Authorize Sheets and open the MAIN worksheet."""
     config = config or load_config()
     sheets = authenticate_sheets(config)
     main = open_main_sheet(sheets, config)
-    return None, sheets, main
+    return sheets, main

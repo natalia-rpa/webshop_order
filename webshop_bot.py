@@ -220,7 +220,7 @@ class WebshopBot:
                 port,
             )
 
-    def start(self, *, attach_only: bool = False) -> Page:
+    def start(self) -> Page:
         """
         Start Playwright against bot Chrome over CDP (same profile as --login).
 
@@ -240,83 +240,66 @@ class WebshopBot:
         self._playwright = sync_playwright().start()
 
         if self._cdp_reachable(port):
-            if attach_only:
-                logger.info("Active Chrome CDP found on port %s — attaching.", port)
-                try:
-                    self._browser = self._playwright.chromium.connect_over_cdp(cdp_url)
-                    self._owns_chrome = False
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"No usable Chrome session on CDP port {port}: {exc}. "
-                        "Run: python main.py --login"
-                    ) from exc
-            else:
-                mode = "hidden" if self.headless else "visible"
-                logger.info(
-                    "Existing Chrome on port %s — restarting as %s.",
-                    port,
-                    mode,
-                )
-                self._stop_chrome_on_port(port)
-                self._clear_profile_locks(profile)
-
-        if self._browser is None:
-            if attach_only:
-                raise RuntimeError(
-                    f"No active Chrome session on CDP port {port}. "
-                    "Run: python main.py --login"
-                )
-            self._clear_profile_locks(profile)
-            chrome_exe = self._find_chrome_exe()
-            chrome_args = [
-                str(chrome_exe),
-                f"--user-data-dir={profile}",
-                "--profile-directory=Default",
-                f"--remote-debugging-port={port}",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-session-crashed-bubble",
-                "--password-store=basic",
-                "--disable-save-password-bubble",
-            ]
-            if self.headless:
-                chrome_args.append("--headless=new")
-            chrome_args.append(self.base_url)
-
-            mode = "hidden (headless)" if self.headless else "visible"
-            logger.info("Launching Chrome %s (CDP port %s)...", mode, port)
-            creationflags = 0
-            if sys.platform == "win32":
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-                if self.headless:
-                    creationflags |= subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
-            self._chrome_proc = subprocess.Popen(
-                chrome_args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=creationflags,
+            mode = "hidden" if self.headless else "visible"
+            logger.info(
+                "Existing Chrome on port %s — restarting as %s.",
+                port,
+                mode,
             )
-            self._owns_chrome = True
+            self._stop_chrome_on_port(port)
+            self._clear_profile_locks(profile)
 
-            deadline = time.time() + 45
-            last_err: Optional[Exception] = None
-            while time.time() < deadline:
-                if self._chrome_proc.poll() is not None:
-                    raise RuntimeError(
-                        f"Chrome exited early (code {self._chrome_proc.returncode}). "
-                        "Close other Hiab Bot Chrome windows and retry, "
-                        "or run: python main.py --login"
-                    )
-                try:
-                    self._browser = self._playwright.chromium.connect_over_cdp(cdp_url)
-                    break
-                except Exception as exc:
-                    last_err = exc
-                    time.sleep(0.4)
-            else:
+        self._clear_profile_locks(profile)
+        chrome_exe = self._find_chrome_exe()
+        chrome_args = [
+            str(chrome_exe),
+            f"--user-data-dir={profile}",
+            "--profile-directory=Default",
+            f"--remote-debugging-port={port}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--password-store=basic",
+            "--disable-save-password-bubble",
+        ]
+        if self.headless:
+            chrome_args.append("--headless=new")
+        chrome_args.append(self.base_url)
+
+        mode = "hidden (headless)" if self.headless else "visible"
+        logger.info("Launching Chrome %s (CDP port %s)...", mode, port)
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            if self.headless:
+                creationflags |= subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        self._chrome_proc = subprocess.Popen(
+            chrome_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        self._owns_chrome = True
+
+        deadline = time.time() + 45
+        last_err: Optional[Exception] = None
+        while time.time() < deadline:
+            if self._chrome_proc.poll() is not None:
                 raise RuntimeError(
-                    f"Could not attach to Chrome CDP at {cdp_url}: {last_err}"
+                    f"Chrome exited early (code {self._chrome_proc.returncode}). "
+                    "Close other Hiab Bot Chrome windows and retry, "
+                    "or run: python main.py --login"
                 )
+            try:
+                self._browser = self._playwright.chromium.connect_over_cdp(cdp_url)
+                break
+            except Exception as exc:
+                last_err = exc
+                time.sleep(0.4)
+        else:
+            raise RuntimeError(
+                f"Could not attach to Chrome CDP at {cdp_url}: {last_err}"
+            )
 
         assert self._browser is not None
         if not self._browser.contexts:

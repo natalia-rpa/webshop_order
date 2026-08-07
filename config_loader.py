@@ -21,23 +21,8 @@ def _parse_scopes(raw: str) -> List[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
-def gmail_scopes(config: configparser.ConfigParser) -> List[str]:
-    return _parse_scopes(config.get("gmail", "scopes", fallback=""))
-
-
 def google_scopes(config: configparser.ConfigParser) -> List[str]:
     return _parse_scopes(config.get("google", "scopes", fallback=""))
-
-
-def oauth_scopes(config: configparser.ConfigParser) -> List[str]:
-    """Combined Gmail + Sheets/Drive scopes for a single OAuth consent."""
-    seen = set()
-    combined: List[str] = []
-    for scope in gmail_scopes(config) + google_scopes(config):
-        if scope not in seen:
-            seen.add(scope)
-            combined.append(scope)
-    return combined
 
 
 def webshop_password(config: configparser.ConfigParser) -> str:
@@ -57,11 +42,6 @@ def unattended_poll_interval_sec(config: configparser.ConfigParser) -> int:
 def unattended_headless(config: configparser.ConfigParser) -> bool:
     """Whether unattended mode runs Chrome hidden (headless). Default True."""
     return config.getboolean("unattended", "headless", fallback=True)
-
-
-def webshop_cdp_port(config: configparser.ConfigParser) -> int:
-    """Fixed Chrome remote-debugging port for --login / unattended session share."""
-    return config.getint("webshop", "cdp_port", fallback=9222)
 
 
 def alert_notify_emails(config: configparser.ConfigParser) -> List[str]:

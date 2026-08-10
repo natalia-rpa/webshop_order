@@ -3,8 +3,7 @@ Webshop Order Robot — entry point.
 
 process_emails():
   1. Google Sheets init
-  2. Find MAIN rows: MANUAL_PHASE=PROCESSING & ROBOT_PHASE empty
-     & ACTIVE_PHASE (COL G)=5_VALID
+  2. Find MAIN rows: MANUAL_PHASE=PROCESSING & ROBOT_PHASE empty & ACTIVE_PHASE (COL G)=5_VALID
   3. Extract client data + prepare A/B CSV batches (max 100 rows each)
   4. Playwright: login, impersonate, batch upload loop, add to cart
   5. Update ROBOT_PHASE (PROCESSING / ERROR / FINISHED);
@@ -18,8 +17,6 @@ run_unattended():
 """
 
 from __future__ import annotations
-
-import argparse
 import sys
 import time
 import traceback
@@ -444,7 +441,6 @@ def bootstrap_login(timeout_min: int = 5) -> int:
     ).resolve()
     profile.mkdir(parents=True, exist_ok=True)
     (profile / "Default").mkdir(parents=True, exist_ok=True)
-    _label_bot_chrome_profile(profile, display_name="Hiab Bot")
 
     # Visible browser required for MFA / passkey.
     config.set("webshop", "headless", "false")
@@ -465,8 +461,6 @@ def bootstrap_login(timeout_min: int = 5) -> int:
         logger.info(
             "Active session ready. You can close this Chrome window, then run:\n"
             "  python main.py --unattended\n"
-            "or:\n"
-            "  python unattended_main.py\n"
             "(Unattended starts Chrome hidden — only logs are visible.)"
         )
         # Disconnect Playwright only — Chrome stays signed in.
@@ -482,37 +476,7 @@ def bootstrap_login(timeout_min: int = 5) -> int:
         return 1
 
 
-def _label_bot_chrome_profile(profile: Path, display_name: str = "Hiab Bot") -> None:
-    """Set Chrome UI profile name so the avatar menu shows Hiab Bot."""
-    import json
-
-    local_state_path = profile / "Local State"
-    data: dict = {}
-    if local_state_path.is_file():
-        try:
-            data = json.loads(local_state_path.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    profile_block = data.setdefault("profile", {})
-    info = profile_block.setdefault("info_cache", {})
-    default = info.setdefault("Default", {})
-    default["name"] = display_name
-    default["shortcut_name"] = display_name
-    profile_block["last_used"] = "Default"
-    local_state_path.write_text(json.dumps(data), encoding="utf-8")
-
-    prefs_path = profile / "Default" / "Preferences"
-    if prefs_path.is_file():
-        try:
-            prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
-            prefs.setdefault("profile", {})["name"] = display_name
-            prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
-        except Exception:
-            pass
-
-
-def main(argv: Optional[list] = None) -> int:
-    import sys
+def main() -> int:
 
     unattended = False
     max_orders = None
@@ -528,7 +492,12 @@ def main(argv: Optional[list] = None) -> int:
     if '--login' in sys.argv:
         login = True
 
+    if not check_required_files():
+     return 1    
+
     print(f"Unattended: {unattended}, Max: {max_orders}")
+
+
 
     try:
         if login:

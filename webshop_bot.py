@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
+import psutil
 
 from playwright.sync_api import (
     Browser,
@@ -50,8 +51,6 @@ class WebshopBot:
         self.on_phase = on_phase or (lambda phase, detail: None)
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
-        self._chrome_proc: Optional[subprocess.Popen] = None
-        self._cdp_port: Optional[int] = None
         self._owns_chrome = False
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
@@ -75,8 +74,7 @@ class WebshopBot:
             "user_data_dir",
             fallback="static/browser_profile",
         ).strip() or "static/browser_profile"
-        # Fixed port (default 9222) so --login and unattended share one Chrome.
-        self.cdp_port = self.config.getint("webshop", "cdp_port", fallback=9222)
+
 
     def _phase(self, detail: str) -> None:
         self.on_phase("PROCESSING", detail)
@@ -132,124 +130,35 @@ class WebshopBot:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
-    @staticmethod
-    def _cdp_reachable(port: int, timeout_s: float = 0.4) -> bool:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=timeout_s):
-                return True
-        except OSError:
-            return False
-
-    @staticmethod
-    def _pids_listening_on_port(port: int) -> List[int]:
-        """Return PIDs that own a TCP listener on the given local port."""
-        pids: List[int] = []
-        if sys.platform == "win32":
-            try:
-                result = subprocess.run(
-                    [
-                        "powershell",
-                        "-NoProfile",
-                        "-Command",
-                        f"(Get-NetTCPConnection -LocalPort {port} "
-                        f"-State Listen -ErrorAction SilentlyContinue)."
-                        f"OwningProcess | Select-Object -Unique",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
-                )
-                for line in (result.stdout or "").splitlines():
-                    line = line.strip()
-                    if line.isdigit():
-                        pids.append(int(line))
-            except Exception as exc:
-                logger.debug("Could not resolve CDP port owner: %s", exc)
-        else:
-            try:
-                result = subprocess.run(
-                    ["lsof", "-ti", f":{port}"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                for line in (result.stdout or "").splitlines():
-                    line = line.strip()
-                    if line.isdigit():
-                        pids.append(int(line))
-            except Exception as exc:
-                logger.debug("Could not resolve CDP port owner: %s", exc)
-        return pids
-
     def _stop_chrome_on_port(self, port: int) -> None:
-        """
-        Stop any Chrome already listening on the CDP port.
-
-        Used when starting headless/hidden so a leftover visible --login window
-        is closed and relaunched without a UI.
-        """
-        if not self._cdp_reachable(port):
-            return
-        logger.info(
-            "Stopping Chrome on CDP port %s so hidden Chrome can take over.",
-            port,
-        )
-        pids = self._pids_listening_on_port(port)
-        for pid in pids:
+        """Eleganckie zamykanie tylko tego Chrome'a, który należy do bota."""
+        logger.info("Szukam procesów Chrome bota na porcie %s...", port)
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
-                if sys.platform == "win32":
-                    subprocess.run(
-                        ["taskkill", "/PID", str(pid), "/T", "/F"],
-                        capture_output=True,
-                        text=True,
-                        timeout=20,
-                        creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
-                    )
-                else:
-                    os.kill(pid, 15)
-            except Exception as exc:
-                logger.warning("Failed to stop Chrome pid %s: %s", pid, exc)
-
-        deadline = time.time() + 15
-        while time.time() < deadline and self._cdp_reachable(port):
-            time.sleep(0.3)
-        if self._cdp_reachable(port):
-            logger.warning(
-                "Chrome still listening on port %s after stop attempt.",
-                port,
-            )
+                name = proc.info['name']
+                if name and name.lower() in ('chrome.exe', 'chrome'):
+                    cmdline = proc.info['cmdline']
+                    # Zamykamy tylko jeśli w poleceniu startowym przeglądarki jest nasz port
+                    if cmdline and any(f"--remote-debugging-port={port}" in arg for arg in cmdline):
+                        logger.info("Zabijam stary proces bota: PID %s", proc.info['pid'])
+                        proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
 
     def start(self) -> Page:
-        """
-        Start Playwright against bot Chrome over CDP (same profile as --login).
-
-        Launches Chrome in the requested mode (hidden vs visible). Any existing
-        Chrome on cdp_port is stopped first so a leftover --login window does not
-        stay visible in unattended, and leftover headless Chrome does not block
-        MFA during --login. The signed-in profile on disk is reused.
-        """
+        """Uruchamia ludzkiego Chrome'a i podpina do niego Playwrighta (pozwala na okienka MFA)."""
         logger.info("Initializing browser...")
         profile = Path(self.user_data_dir).resolve()
         profile.mkdir(parents=True, exist_ok=True)
-        logger.info("Using bot Chrome profile: %s", profile)
-
-        port = self.cdp_port if self.cdp_port > 0 else self._pick_free_port()
-        self._cdp_port = port
-        cdp_url = f"http://127.0.0.1:{port}"
-        self._playwright = sync_playwright().start()
-
-        if self._cdp_reachable(port):
-            mode = "hidden" if self.headless else "visible"
-            logger.info(
-                "Existing Chrome on port %s — restarting as %s.",
-                port,
-                mode,
-            )
-            self._stop_chrome_on_port(port)
-            self._clear_profile_locks(profile)
-
         self._clear_profile_locks(profile)
+
+        # Wybieramy port i upewniamy się, że jest wolny (ubijamy stare procesy bota)
+        port = getattr(self, 'cdp_port', 9222)
+        if port <= 0:
+            port = self._pick_free_port()
+        self._cdp_port = port
+        self._stop_chrome_on_port(port)
+
         chrome_exe = self._find_chrome_exe()
         chrome_args = [
             str(chrome_exe),
@@ -268,54 +177,42 @@ class WebshopBot:
 
         mode = "hidden (headless)" if self.headless else "visible"
         logger.info("Launching Chrome %s (CDP port %s)...", mode, port)
-        creationflags = 0
-        if sys.platform == "win32":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-            if self.headless:
-                creationflags |= subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        
+        # Odpalenie fizycznego Chrome'a
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        if sys.platform == "win32" and self.headless:
+            creationflags |= subprocess.CREATE_NO_WINDOW
+            
         self._chrome_proc = subprocess.Popen(
             chrome_args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=creationflags,
         )
-        self._owns_chrome = True
 
+        # Podłączenie Playwrighta
+        self._playwright = sync_playwright().start()
+        cdp_url = f"http://127.0.0.1:{port}"
         deadline = time.time() + 45
-        last_err: Optional[Exception] = None
+        
         while time.time() < deadline:
-            if self._chrome_proc.poll() is not None:
-                raise RuntimeError(
-                    f"Chrome exited early (code {self._chrome_proc.returncode}). "
-                    "Close other Hiab Bot Chrome windows and retry, "
-                    "or run: python main.py --login"
-                )
             try:
                 self._browser = self._playwright.chromium.connect_over_cdp(cdp_url)
                 break
-            except Exception as exc:
-                last_err = exc
-                time.sleep(0.4)
+            except Exception:
+                time.sleep(0.5)
         else:
-            raise RuntimeError(
-                f"Could not attach to Chrome CDP at {cdp_url}: {last_err}"
-            )
+            raise RuntimeError(f"Could not attach to Chrome CDP at {cdp_url}")
 
-        assert self._browser is not None
-        if not self._browser.contexts:
-            raise RuntimeError("Chrome CDP connected but no browser contexts found.")
         self.context = self._browser.contexts[0]
         self.context.set_default_timeout(self.timeout)
         self.context.set_default_navigation_timeout(self.nav_timeout)
 
-        self.page = self._pick_webshop_page() or self.context.new_page()
-        logger.info(
-            "Browser ready via CDP (port %s, owns_chrome=%s).",
-            port,
-            self._owns_chrome,
-        )
+        self.page = self._pick_webshop_page() or self.context.pages[0]
+        logger.info("Browser ready via CDP.")
         self._goto_webshop()
         return self.page
+
 
     def _pick_webshop_page(self) -> Optional[Page]:
         assert self.context is not None
@@ -324,6 +221,7 @@ class WebshopBot:
             if "webshop.hiab.com" in url or "hiab.com" in url:
                 return pg
         return self.context.pages[0] if self.context.pages else None
+        
 
     def _goto_webshop(self) -> None:
         """Open the webshop URL in the active browser tab."""
@@ -334,52 +232,37 @@ class WebshopBot:
         logger.info("Opened: %s", self.page.url)
 
     def stop(self, *, keep_browser: bool = False) -> None:
-        """
-        Disconnect Playwright.
-
-        keep_browser=True leaves Chrome running so the signed-in session stays
-        active for the next --unattended / --login attach.
-        """
-        leave_chrome = keep_browser or not self._owns_chrome
+        """Rozłącza bota. keep_browser=True zostawia Chrome otwarte (wymagane przy logowaniu)."""
         try:
             if self._browser is not None:
-                try:
-                    self._browser.close()
-                except Exception:
-                    pass
-            elif self.context is not None and not leave_chrome:
-                try:
-                    self.context.close()
-                except Exception:
-                    pass
-        finally:
-            self._browser = None
-            self.context = None
-            self.page = None
-            if not leave_chrome and self._chrome_proc is not None:
-                try:
-                    if self._chrome_proc.poll() is None:
-                        self._chrome_proc.terminate()
-                        try:
-                            self._chrome_proc.wait(timeout=8)
-                        except subprocess.TimeoutExpired:
-                            self._chrome_proc.kill()
-                except Exception:
-                    pass
-                self._chrome_proc = None
-                logger.info("Browser closed.")
-            else:
-                self._chrome_proc = None
-                logger.info(
-                    "Disconnected from Chrome; session left active on CDP port %s.",
-                    self._cdp_port,
-                )
-            if self._playwright:
-                try:
-                    self._playwright.stop()
-                except Exception:
-                    pass
-                self._playwright = None
+                self._browser.close()
+        except Exception:
+            pass
+
+        self._browser = None
+        self.context = None
+        self.page = None
+
+        # Zamykanie fizycznego Chrome'a jeśli to nie było logowanie manualne
+        if not keep_browser and self._chrome_proc is not None:
+            try:
+                if self._chrome_proc.poll() is None:
+                    self._chrome_proc.terminate()
+            except Exception:
+                pass
+            self._chrome_proc = None
+            logger.info("Browser closed.")
+        else:
+            logger.info("Disconnected from Playwright. Chrome stays open.")
+
+        if getattr(self, '_playwright', None):
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+
+
 
     def __enter__(self) -> "WebshopBot":
         self.start()
@@ -614,8 +497,7 @@ class WebshopBot:
         )
         toggle.wait_for(state="visible", timeout=timeout_ms)
         logger.info(
-            "Impersonator visible — active session ready on CDP port %s (profile %s)",
-            self._cdp_port,
+            "Impersonator visible — active session ready (profile %s)",
             Path(self.user_data_dir).resolve(),
         )
 

@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Union
 import pandas as pd
 from logging_setup import get_logger
 
@@ -16,7 +15,7 @@ class BatchPayload:
     """Item/quantity dataframe plus on-disk CSV chunks ready for Batch Order upload."""
 
     items: pd.DataFrame
-    batch_files: List[Path]
+    batch_files: list[Path]
     total_rows: int
     batch_size: int
 

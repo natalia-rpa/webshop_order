@@ -428,8 +428,8 @@ def check_required_files() -> bool:
         return False
     return True
 
-
-def bootstrap_login(timeout_min: int = 10) -> int:
+# wait for 5 minutes for an action
+def bootstrap_login(timeout_min: int = 5) -> int:
     """
     Open / attach the bot Chrome profile and wait until the webshop session
     is active (impersonator visible). Leaves Chrome running on the fixed CDP
@@ -461,7 +461,7 @@ def bootstrap_login(timeout_min: int = 10) -> int:
     bot = WebshopBot(config=config)
     try:
         bot.start()
-        bot.wait_until_impersonator_ready(timeout_ms=max(1, timeout_min) * 60_000)
+        bot.wait_until_impersonator_ready(timeout_ms=timeout_min*60000)
         logger.info(
             "Active session ready. You can close this Chrome window, then run:\n"
             "  python main.py --unattended\n"
@@ -512,55 +512,31 @@ def _label_bot_chrome_profile(profile: Path, display_name: str = "Hiab Bot") -> 
 
 
 def main(argv: Optional[list] = None) -> int:
-    parser = argparse.ArgumentParser(description="Hiab Webshop Order Robot")
-    parser.add_argument(
-        "--max",
-        type=int,
-        default=None,
-        help="Process at most N pending rows this run (or per unattended cycle).",
-    )
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="Only verify required secret/config files exist.",
-    )
-    parser.add_argument(
-        "--login",
-        action="store_true",
-        help=(
-            "Open/attach bot Chrome and wait until the webshop session is active. "
-            "Then run --unattended (Chrome will be hidden; logs only)."
-        ),
-    )
-    parser.add_argument(
-        "--login-timeout-min",
-        type=int,
-        default=10,
-        help="Minutes to wait for impersonator during --login (default: 10).",
-    )
-    parser.add_argument(
-        "--unattended",
-        action="store_true",
-        help=(
-            "Hidden background mode: run Chrome headless (logs only), keep the "
-            "signed-in session alive, poll MAIN every poll_interval_sec "
-            "(default 60s), process PROCESSING+5_VALID rows without re-login."
-        ),
-    )
-    args = parser.parse_args(argv)
+    import sys
 
-    if args.check:
-        return 0 if check_required_files() else 1
+    unattended = False
+    max_orders = None
+    login = False
 
-    if not check_required_files():
-        return 1
+    if '--unattended' in sys.argv:
+        unattended = True
+
+    if '--max' in sys.argv:
+        idx = sys.argv.index('--max')
+        max_orders = int(sys.argv[idx + 1])
+
+    if '--login' in sys.argv:
+        login = True
+
+    print(f"Unattended: {unattended}, Max: {max_orders}")
 
     try:
-        if args.login:
-            return bootstrap_login(timeout_min=args.login_timeout_min)
-        if args.unattended:
-            return run_unattended(max_orders=args.max)
-        process_emails(max_orders=args.max)
+        if login:
+            return bootstrap_login()
+        if unattended:
+            return run_unattended(max_orders=max_orders)
+
+        process_emails(max_orders=max_orders)
         return 0
     except KeyboardInterrupt:
         get_logger().warning("Interrupted by user.")

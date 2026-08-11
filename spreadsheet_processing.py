@@ -25,6 +25,7 @@ class OrderRow:
     row_number: int  # 1-based sheet row at discovery; may shift when new emails insert
     client_number: str
     client_name: str
+    client_mail: str
     email_id: str  # stable key — re-resolve row before phase/timestamp edits
     attachments_path: str
     manual_phase: str
@@ -291,6 +292,7 @@ def find_pending_orders(
     idx_client_number = resolve_column(header_map, cols.get("client_number"))
     idx_client_name = resolve_column(header_map, cols.get("client_name"))
     idx_email_id = resolve_column(header_map, cols.get("email_id"))
+    idx_client_mail = resolve_column(header_map, cols.get("client_mail", "MAIL"))
     idx_attachments = resolve_column(header_map, cols.get("attachments_path"))
     idx_manual = resolve_column(header_map, cols.get("manual_phase"))
     idx_robot = resolve_column(header_map, cols.get("robot_phase"))
@@ -325,6 +327,7 @@ def find_pending_orders(
             client_number=cell(idx_client_number),
             client_name=cell(idx_client_name),
             email_id=cell(idx_email_id),
+            client_mail=cell(idx_client_mail),
             attachments_path=cell(idx_attachments),
             manual_phase=manual,
             robot_phase=robot,

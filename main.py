@@ -167,6 +167,7 @@ def process_single_order(
         bot.run_batch_order(
             client_number=order.client_number,
             client_name=order.client_name,
+            client_mail=order.client_mail,
             batch_csvs=payload.batch_files,
             require_existing_session=require_existing_session,
         )

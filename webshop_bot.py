@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import datetime
 import os
 import socket
 import subprocess
@@ -27,7 +28,6 @@ from logging_setup import get_logger
 logger = get_logger()
 
 PhaseCallback = Callable[[str, str], None]
-
 
 class WebshopBot:
     """
@@ -131,28 +131,28 @@ class WebshopBot:
             return int(sock.getsockname()[1])
 
     def _stop_chrome_on_port(self, port: int) -> None:
-        """Eleganckie zamykanie tylko tego Chrome'a, który należy do bota."""
-        logger.info("Szukam procesów Chrome bota na porcie %s...", port)
+        """close chrome which belongs to bot (delete all processes)"""
+        logger.info("Searching for chrome processes on port %s...", port)
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
                 name = proc.info['name']
                 if name and name.lower() in ('chrome.exe', 'chrome'):
                     cmdline = proc.info['cmdline']
-                    # Zamykamy tylko jeśli w poleceniu startowym przeglądarki jest nasz port
+                    # close only if the port is in the command line
                     if cmdline and any(f"--remote-debugging-port={port}" in arg for arg in cmdline):
-                        logger.info("Zabijam stary proces bota: PID %s", proc.info['pid'])
+                        logger.info("Killing old bot process: PID %s", proc.info['pid'])
                         proc.kill()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
     def start(self) -> Page:
-        """Uruchamia ludzkiego Chrome'a i podpina do niego Playwrighta (pozwala na okienka MFA)."""
+        """Starts "normal" Chrome and attaches Playwright to it (allows MFA windows)."""
         logger.info("Initializing browser...")
         profile = Path(self.user_data_dir).resolve()
         profile.mkdir(parents=True, exist_ok=True)
         self._clear_profile_locks(profile)
 
-        # Wybieramy port i upewniamy się, że jest wolny (ubijamy stare procesy bota)
+        # pick port and ensure it is free (kill old bot processes)
         port = getattr(self, 'cdp_port', 9222)
         if port <= 0:
             port = self._pick_free_port()
@@ -178,7 +178,7 @@ class WebshopBot:
         mode = "hidden (headless)" if self.headless else "visible"
         logger.info("Launching Chrome %s (CDP port %s)...", mode, port)
         
-        # Odpalenie fizycznego Chrome'a
+        # start physical Chrome
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
         if sys.platform == "win32" and self.headless:
             creationflags |= subprocess.CREATE_NO_WINDOW
@@ -190,7 +190,7 @@ class WebshopBot:
             creationflags=creationflags,
         )
 
-        # Podłączenie Playwrighta
+        # attach Playwright
         self._playwright = sync_playwright().start()
         cdp_url = f"http://127.0.0.1:{port}"
         deadline = time.time() + 45
@@ -232,7 +232,7 @@ class WebshopBot:
         logger.info("Opened: %s", self.page.url)
 
     def stop(self, *, keep_browser: bool = False) -> None:
-        """Rozłącza bota. keep_browser=True zostawia Chrome otwarte (wymagane przy logowaniu)."""
+        """Disconnects the bot. keep_browser=True leaves Chrome open (required for login)."""
         try:
             if self._browser is not None:
                 self._browser.close()
@@ -243,7 +243,7 @@ class WebshopBot:
         self.context = None
         self.page = None
 
-        # Zamykanie fizycznego Chrome'a jeśli to nie było logowanie manualne
+        # close physical Chrome if it was not manual login
         if not keep_browser and self._chrome_proc is not None:
             try:
                 if self._chrome_proc.poll() is None:
@@ -532,6 +532,7 @@ class WebshopBot:
         self,
         client_number: str,
         client_name: str,
+        client_mail: str,
         batch_csvs: Sequence[str | Path],
         *,
         require_existing_session: bool = False,
@@ -566,6 +567,11 @@ class WebshopBot:
                 self._restore_session_via_sso()
 
         self._impersonate_user(client_number, client_name)
+
+        email_prefix = (client_mail or "").strip()[:8]
+        cart_name = f"{datetime.datetime.now().strftime('%d%m%Y_%H%M')}_{email_prefix}"
+        self._create_saved_cart(cart_name=cart_name)
+
         self._open_batch_order()
 
         total = len(paths)
@@ -876,22 +882,22 @@ class WebshopBot:
         """Click accessible button (Continue) via Windows UI Automation."""
         safe = name.replace("'", "''")
         script = f"""
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-$root = [System.Windows.Automation.AutomationElement]::RootElement
-$nameCond = New-Object System.Windows.Automation.PropertyCondition(
-  [System.Windows.Automation.AutomationElement]::NameProperty, '{safe}')
-$btn = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $nameCond)
-if ($null -eq $btn) {{ exit 2 }}
-try {{
-  $pattern = [System.Windows.Automation.InvokePattern]::Pattern
-  $inv = $btn.GetCurrentPattern($pattern)
-  $inv.Invoke()
-  exit 0
-}} catch {{
-  exit 3
-}}
-"""
+        Add-Type -AssemblyName UIAutomationClient
+        Add-Type -AssemblyName UIAutomationTypes
+        $root = [System.Windows.Automation.AutomationElement]::RootElement
+        $nameCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::NameProperty, '{safe}')
+        $btn = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $nameCond)
+        if ($null -eq $btn) {{ exit 2 }}
+        try {{
+        $pattern = [System.Windows.Automation.InvokePattern]::Pattern
+        $inv = $btn.GetCurrentPattern($pattern)
+        $inv.Invoke()
+        exit 0
+        }} catch {{
+        exit 3
+        }}
+        """
         try:
             result = subprocess.run(
                 [
@@ -1250,6 +1256,57 @@ try {{
             f"(last query {last_query!r}, {last_count} result(s))."
         )
 
+    def _create_saved_cart(self, cart_name: str, description: str = "Created by bot") -> None:
+        """Open cart menu, create new 'Saved cart' and close the window."""
+        assert self.page is not None
+        page = self.page
+
+        self._phase(f"Creating new cart: {cart_name}")
+        time.sleep(2.0)
+        # 1. Click on cart icon (ignore "4", search for cart link/button)
+        try:
+            cart_icon = page.locator(
+                'button.wishlist-toggle:visible, '
+                'button.right-off-canvas-toggle[title*="Saved carts"]:visible'
+            ).first
+            cart_icon.wait_for(state="visible", timeout=5000)
+            
+            # force=True forces click ignoring weird CSS layers
+            cart_icon.click(force=True)
+            logger.info("TIK TAK CART ICON - clicked")
+            time.sleep(2.0)
+        except Exception as exc:
+            logger.warning("Failed to click on cart icon (maybe it is already open): %s", exc)
+
+        # 2. Click on 'Create new cart'
+        create_btn = page.get_by_role("button", name="Create new cart").first
+        create_btn.wait_for(state="visible", timeout=10000)
+        create_btn.click()
+
+        # 3. Fill cart data
+        name_input = page.get_by_role("textbox", name="Cart name").first
+        name_input.wait_for(state="visible", timeout=5000)
+        
+        # clear field and enter name
+        name_input.click()
+        name_input.fill(cart_name)
+
+        desc_input = page.get_by_role("textbox", name="Cart description").first
+        if desc_input.count() > 0 and desc_input.is_visible():
+            desc_input.fill(description)
+
+        # 4. Save cart
+        page.get_by_role("button", name="Save", exact=True).first.click()
+        self._wait_loaded(page, settle_s=1.5)
+
+        # 5. Close confirmation window
+        close_btn = page.get_by_role("button", name="Close saved cart").first
+        if close_btn.count() > 0 and close_btn.is_visible():
+            close_btn.click()
+            time.sleep(0.5)
+
+        logger.info("Successfully created cart: %s", cart_name)
+
     def _batch_order_url(self) -> str:
         """Absolute Batch Order URL (relative paths fail under CDP)."""
         base = self.base_url.rstrip("/")
@@ -1319,7 +1376,7 @@ try {{
 
         self._phase(f"Adding batch {batch_index}/{batch_total} to cart")
         add_btn = page.locator(
-            "#batch-add-to-cart, button.batch-add-to-cart, button:has-text('Add to cart')"
+            "#batch-saved-card-add, button.batch-saved-card-add, button:has-text('add to saved cart')"
         ).first
         add_btn.wait_for(state="visible")
 

@@ -395,44 +395,28 @@ class WebshopBot:
             f"url={page.url!r}. If the header looks wrong, run: python main.py --login"
         )
 
-    def ensure_signed_in_session(self, wait_ms: int = 30_000) -> None:
+    def ensure_signed_in_session(self) -> None:
         """
         Confirm the shared Chrome session is signed in.
         If the session is over, try Login with SSO to restore it.
         """
         assert self.page is not None
-        page = self.page
         self._phase(f"Checking active session for {self.username}")
         self._safe_goto(self.base_url)
-        self._dismiss_cookie_banner(page)
+        self._dismiss_cookie_banner(self.page)
 
-        deadline = time.time() + max(1, wait_ms) / 1000
-        while time.time() < deadline:
-            if self.is_signed_in():
-                logger.info("Active signed-in webshop session confirmed.")
-                return
-            time.sleep(0.5)
+        if self.is_signed_in():
+            logger.info("Active signed-in webshop session confirmed.")
+            return
 
-        # One hard refresh before treating as expired (slow render / chrome-error).
-        logger.warning("Session markers not visible yet — reloading webshop home.")
-        try:
-            page.reload(wait_until="domcontentloaded", timeout=self.nav_timeout)
-            self._wait_loaded(page, settle_s=1.5)
-            self._dismiss_cookie_banner(page)
-        except Exception as exc:
-            logger.warning("Reload failed: %s", exc)
-            self._safe_goto(self.base_url)
-            self._dismiss_cookie_banner(page)
-
-        reload_deadline = time.time() + 15
-        while time.time() < reload_deadline:
-            if self.is_signed_in():
-                logger.info("Active signed-in webshop session confirmed after reload.")
-                return
-            time.sleep(0.5)
-
-        logger.warning("Webshop session is over — trying Login with SSO.")
-        self._restore_session_via_sso()
+        logger.warning("Session expired. Trying automatic SSO login...")
+        self._login()
+        
+        if not self.is_signed_in():
+            raise RuntimeError(
+                "Failed to restore session automatically. "
+                "Run: python main.py --login, to login manually."
+            )
 
     def _restore_session_via_sso(self) -> None:
         """Session expired: Login with SSO, then leftover auth prompts if needed."""
@@ -456,23 +440,6 @@ class WebshopBot:
             "Run: python main.py --login  then complete sign-in / MFA. "
             f"(current url={self.page.url!r})"
         )
-
-    def keep_session_warm(self) -> None:
-        """Light navigation so the long-lived Chrome session stays alive."""
-        if self.page is None:
-            return
-        try:
-            self._safe_goto(self.base_url)
-            self._dismiss_cookie_banner(self.page)
-            if self.is_signed_in():
-                logger.debug("Session keepalive OK (still signed in).")
-            else:
-                logger.warning(
-                    "Session keepalive: session over — trying Login with SSO."
-                )
-                self._restore_session_via_sso()
-        except Exception as exc:
-            logger.warning("Session keepalive failed: %s", exc)
 
     def wait_until_impersonator_ready(self, timeout_ms: int = 600_000) -> None:
         """

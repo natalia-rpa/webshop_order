@@ -403,7 +403,6 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
                     _alert_session_inactive(config, exc)
                     return 1
 
-            bot.keep_session_warm()
             logger.info("Next poll in %ss (session stays active)...", poll_sec)
             time.sleep(poll_sec)
     finally:

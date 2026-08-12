@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import datetime
 import os
 import socket
@@ -749,10 +748,6 @@ class WebshopBot:
                 logger.info("Clicked page-level Continue.")
                 break
 
-            # Chrome OS/browser passkey dialog (outside DOM)
-            if self._press_browser_passkey_continue():
-                logger.info("Pressed Continue on passkey dialog.")
-                break
 
             time.sleep(0.8)
         else:
@@ -785,23 +780,7 @@ class WebshopBot:
                     continue
         return False
 
-    def _press_browser_passkey_continue(self) -> bool:
-        """Chrome passkey dialog is outside DOM — use Windows UIA / Enter."""
-        self._focus_chrome_window()
-        if sys.platform == "win32":
-            if self._win_click_button_by_name("Continue"):
-                return True
-            # Continue is the default primary button
-            self._win_send_enter()
-            time.sleep(0.6)
-            self._win_send_enter()
-            return True
-        try:
-            assert self.page is not None
-            self.page.keyboard.press("Enter")
-            return True
-        except Exception:
-            return False
+   
 
     def _focus_web_page(self) -> None:
         assert self.context is not None
@@ -827,221 +806,7 @@ class WebshopBot:
                 chosen.bring_to_front()
             except Exception:
                 pass
-        self._focus_chrome_window()
-
-    def _focus_chrome_window(self) -> bool:
-        if sys.platform != "win32":
-            return False
-        user32 = ctypes.windll.user32
-        found: list = []
-
-        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-        def enum_proc(hwnd, _lparam):
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            length = user32.GetWindowTextLengthW(hwnd)
-            if length == 0:
-                return True
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.GetWindowTextW(hwnd, buf, length + 1)
-            title = buf.value
-            lower = title.lower()
-            if (
-                "chrome" in lower
-                or "passkey" in lower
-                or "salesforce" in lower
-                or "chromium" in lower
-            ):
-                found.append((hwnd, title))
-            return True
-
-        user32.EnumWindows(enum_proc, 0)
-        if not found:
-            return False
-
-        hwnd = found[0][0]
-        for h, title in found:
-            if "passkey" in title.lower():
-                hwnd = h
-                break
-
-        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        user32.SetForegroundWindow(hwnd)
-        time.sleep(0.25)
-        return True
-
-    @staticmethod
-    def _win_send_enter() -> None:
-        user32 = ctypes.windll.user32
-        VK_RETURN = 0x0D
-        KEYEVENTF_KEYUP = 0x0002
-        user32.keybd_event(VK_RETURN, 0, 0, 0)
-        user32.keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0)
-
-    def _win_click_button_by_name(self, name: str) -> bool:
-        """Click accessible button (Continue) via Windows UI Automation."""
-        safe = name.replace("'", "''")
-        script = f"""
-        Add-Type -AssemblyName UIAutomationClient
-        Add-Type -AssemblyName UIAutomationTypes
-        $root = [System.Windows.Automation.AutomationElement]::RootElement
-        $nameCond = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::NameProperty, '{safe}')
-        $btn = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $nameCond)
-        if ($null -eq $btn) {{ exit 2 }}
-        try {{
-        $pattern = [System.Windows.Automation.InvokePattern]::Pattern
-        $inv = $btn.GetCurrentPattern($pattern)
-        $inv.Invoke()
-        exit 0
-        }} catch {{
-        exit 3
-        }}
-        """
-        try:
-            result = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    script,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if result.returncode == 0:
-                logger.info("UI Automation clicked %r.", name)
-                return True
-        except Exception as exc:
-            logger.debug("UI Automation click failed: %s", exc)
-        return False
-
-    def _click_verify_button(self, page: Optional[Page] = None) -> None:
-        """
-        After Log in: press Salesforce Verify (#savebtn).
-        Uses native DOM click / invokeSfdcApp() because Playwright click
-        often skips inline onclick handlers.
-        """
-        assert self.context is not None
-        target = page or self.page
-        assert target is not None
-        self._phase("Clicking Verify")
-
-        deadline = time.time() + 45
-        last_error: Optional[Exception] = None
-
-        while time.time() < deadline:
-            # New window may open after Log in — search every page + frame
-            for pg in list(self.context.pages):
-                try:
-                    if self._try_press_verify_on(pg):
-                        logger.info("Verify pressed on page: %s", pg.url)
-                        self._wait_loaded(pg, settle_s=2.0)
-                        # Keep focus on the page that advanced after Verify
-                        self.page = pg
-                        return
-                except Exception as exc:
-                    last_error = exc
-
-            time.sleep(0.8)
-
-        detail = f" Last error: {last_error}" if last_error else ""
-        raise TimeoutError(
-            'Verify button not pressed after Log in '
-            '(expected <input id="savebtn" value="Verify">).'
-            + detail
-        )
-
-    def _try_press_verify_on(self, page: Page) -> bool:
-        """Return True if Verify was found and activated on this page (or a frame)."""
-        scopes = [page] + list(page.frames)
-
-        for scope in scopes:
-            try:
-                handle = scope.query_selector(
-                    'input#savebtn, '
-                    'input[name="save"][value="Verify"], '
-                    'input.bluebutton[value="Verify"], '
-                    'input[type="button"][value="Verify"]'
-                )
-            except Exception:
-                continue
-
-            if handle is None:
-                continue
-
-            try:
-                visible = handle.is_visible()
-            except Exception:
-                visible = False
-
-            if not visible:
-                # Still try — some Salesforce screens mark it oddly
-                logger.debug("Verify element found but not reported visible; trying anyway.")
-
-            page.bring_to_front()
-            try:
-                handle.scroll_into_view_if_needed(timeout=5000)
-            except Exception:
-                pass
-
-            # 1) Native DOM click (fires inline onclick="invokeSfdcApp()")
-            try:
-                handle.evaluate("el => el.click()")
-                logger.info("Fired native DOM click on Verify (#savebtn).")
-            except Exception as exc:
-                logger.warning("Native Verify click failed: %s", exc)
-
-            time.sleep(0.5)
-
-            # 2) Call the onclick handler directly if still on the same screen
-            try:
-                still_there = scope.query_selector("input#savebtn")
-                if still_there is not None:
-                    invoked = handle.evaluate(
-                        """el => {
-                            try {
-                                if (typeof invokeSfdcApp === 'function') {
-                                    invokeSfdcApp();
-                                    return 'invokeSfdcApp';
-                                }
-                            } catch (e) {}
-                            try {
-                                if (typeof window.invokeSfdcApp === 'function') {
-                                    window.invokeSfdcApp();
-                                    return 'window.invokeSfdcApp';
-                                }
-                            } catch (e) {}
-                            try {
-                                el.dispatchEvent(new MouseEvent('click', {
-                                    bubbles: true,
-                                    cancelable: true,
-                                    view: window
-                                }));
-                                return 'MouseEvent';
-                            } catch (e) {}
-                            return null;
-                        }"""
-                    )
-                    if invoked:
-                        logger.info("Invoked Verify handler via %s.", invoked)
-            except Exception as exc:
-                logger.debug("invokeSfdcApp fallback: %s", exc)
-
-            # 3) Playwright click as last resort
-            try:
-                handle.click(force=True, timeout=5000)
-                logger.info("Playwright force-click on Verify.")
-            except Exception:
-                pass
-
-            time.sleep(1.0)
-            return True
-
-        return False
+   
 
     def _handle_microsoft_auth(self) -> None:
         """

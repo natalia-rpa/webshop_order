@@ -458,6 +458,13 @@ def bootstrap_login(timeout_min: int = 5) -> int:
     bot = WebshopBot(config=config)
     try:
         bot.start()
+
+        try:
+            bot.ensure_signed_in_session(wait_ms=10_000)
+        except Exception as auth_exc:
+            logger.warning("Login failed, wait for MFA: %s", auth_exc)
+            return 1
+        
         bot.wait_until_impersonator_ready(timeout_ms=timeout_min*60000)
         logger.info(
             "Active session ready. You can close this Chrome window, then run:\n"

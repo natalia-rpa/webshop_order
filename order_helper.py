@@ -23,7 +23,7 @@ from spreadsheet_processing import (
 )
 
 # Import the bot (adjust path if you haven't moved it to webshop/bot.py yet)
-from webshop_bot import WebshopBot
+from webshop.webshop_client import WebshopClient
 
 
 def _delete_order_batch_csvs(batch_files: list[Path], row_number: int) -> None:
@@ -43,7 +43,7 @@ def process_single_order(
     sheets_client,
     order: OrderRow,
     config,
-    bot: Optional[WebshopBot] = None,
+    bot: Optional[WebshopClient] = None,
     *,
     require_existing_session: bool = False,
 ) -> bool:
@@ -99,7 +99,7 @@ def process_single_order(
         logger.info("Order has %s item row(s) -> %s batch file(s).", payload.total_rows, payload.batch_count)
 
         if bot is None:
-            bot = WebshopBot(config=config, on_phase=on_phase)
+            bot = WebshopClient(config=config, on_phase=on_phase)
             bot.start()
         else:
             bot.on_phase = on_phase
@@ -152,7 +152,7 @@ def process_emails(
     *,
     force_headless: Optional[bool] = None,
     quiet_when_idle: bool = False,
-    bot: Optional[WebshopBot] = None,
+    bot: Optional[WebshopClient] = None,
     require_existing_session: bool = False,
     logger=None, # Allow injecting logger from main
 ) -> int:
@@ -191,7 +191,7 @@ def process_emails(
     owns_bot = bot is None
     try:
         if bot is None:
-            bot = WebshopBot(config=config)
+            bot = WebshopClient(config=config)
             bot.start()
 
         for order in pending:

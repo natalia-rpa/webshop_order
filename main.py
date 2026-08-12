@@ -33,7 +33,7 @@ from email_notify import notify_session_inactive
 from logging_setup import get_logger, setup_logging
 from order_helper import process_emails
 
-from webshop_bot import WebshopBot
+from webshop.webshop_client import WebshopClient
 
 VERSION = "1.0.0"
 
@@ -92,9 +92,9 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
         poll_sec,
     )
 
-    bot: Optional[WebshopBot] = None
+    bot: Optional[WebshopClient] = None
     try:
-        bot = WebshopBot(config=config)
+        bot = WebshopClient(config=config)
         bot.start()
         try:
             bot.ensure_signed_in_session()
@@ -192,7 +192,7 @@ def bootstrap_login(timeout_min: int = 5) -> int:
         "Waiting until the active webshop session is ready..."
     )
 
-    bot = WebshopBot(config=config)
+    bot = WebshopClient(config=config)
     try:
         bot.start()
 

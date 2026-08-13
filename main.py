@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from config_loader import (
+    
     ensure_runtime_dirs,
     load_config,
     unattended_headless,
@@ -33,7 +34,12 @@ from email_notify import notify_session_inactive
 from logging_setup import get_logger, setup_logging
 from order_helper import process_emails
 
-from webshop.webshop_client import WebshopClient
+
+from webshop.profil_handler import ProfileHandler
+from webshop.webshop_orchestration import webshop_orchestration
+from webshop import login_handler
+
+
 
 VERSION = "1.0.0"
 
@@ -76,7 +82,7 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
     config = load_config()
     ensure_runtime_dirs(config)
     logger = _bootstrap_logging(config)
-
+    base_url = config.get("webshop", "base_url")
     poll_sec = unattended_poll_interval_sec(config)
     force_headless = unattended_headless(config)
     config.set("webshop", "headless", "true" if force_headless else "false")
@@ -92,17 +98,23 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
         poll_sec,
     )
 
-    bot: Optional[WebshopClient] = None
+    profile: Optional[ProfileHandler] = None
     try:
-        bot = WebshopClient(config=config)
-        bot.start()
+        profile = ProfileHandler(config)
+        page = profile.start()
+
         try:
-            bot.ensure_signed_in_session()
+            page.goto(base_url)
+            login_handler.dismiss_cookie_banner(page)
+            if not login_handler.is_signed_in(page):
+                login_handler.login(page, config)
+                if not login_handler.is_signed_in(page):
+                    raise RuntimeError("Failed to restore session automatically. Run: python main.py --login")
         except RuntimeError as exc:
             logger.error("%s", exc)
             if _is_session_inactive_error(exc):
                 _alert_session_inactive(config, exc)
-            bot.stop(keep_browser=True)
+            page.stop(keep_browser=True)
             return 1
 
         logger.info(
@@ -119,7 +131,7 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
                     max_orders=max_orders,
                     force_headless=force_headless,
                     quiet_when_idle=True,
-                    bot=bot,
+                    profile=profile,
                     require_existing_session=True,
                 )
             except KeyboardInterrupt:
@@ -144,9 +156,9 @@ def run_unattended(max_orders: Optional[int] = None) -> int:
             logger.info("Next poll in %ss (session stays active)...", poll_sec)
             time.sleep(poll_sec)
     finally:
-        if bot is not None:
+        if profile is not None:
             # Leave Chrome signed-in for the next unattended / --login attach.
-            bot.stop(keep_browser=True)
+            profile.stop(keep_browser=True)
  
 
 
@@ -191,31 +203,37 @@ def bootstrap_login(timeout_min: int = 5) -> int:
         "Sign in manually if prompted (passkey / MFA). "
         "Waiting until the active webshop session is ready..."
     )
-
-    bot = WebshopClient(config=config)
+    base_url = config.get("webshop", "base_url")
+    profile = ProfileHandler(config)
     try:
-        bot.start()
+        page = profile.start()
 
         try:
-            bot.ensure_signed_in_session(wait_ms=10_000)
+            page.goto(base_url)
+            login_handler.dismiss_cookie_banner(page)
         except Exception as auth_exc:
             logger.warning("Login failed, wait for MFA: %s", auth_exc)
             return 1
         
-        bot.wait_until_impersonator_ready(timeout_ms=timeout_min*60000)
+        toggle = page.locator(login_handler.impersonator_toggle_selector()).first
+        try:
+            if not (toggle.count() > 0 and toggle.is_visible()):
+                toggle.wait_for(state="visible", timeout=timeout_min * 60000)
+        except Exception:
+            pass
+
         logger.info(
             "Active session ready. You can close this Chrome window, then run:\n"
             "  python main.py --unattended\n"
-            "(Unattended starts Chrome hidden — only logs are visible.)"
         )
         # Disconnect Playwright only — Chrome stays signed in.
-        bot.stop(keep_browser=True)
+        profile.stop(keep_browser=True)
         return 0
     except Exception as exc:
         logger.error("Login bootstrap failed: %s", exc)
         logger.error(traceback.format_exc())
         try:
-            bot.stop(keep_browser=True)
+            profile.stop(keep_browser=True)
         except Exception:
             pass
         return 1

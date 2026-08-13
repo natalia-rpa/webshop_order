@@ -23,7 +23,8 @@ from spreadsheet_processing import (
 )
 
 # Import the bot (adjust path if you haven't moved it to webshop/bot.py yet)
-from webshop.webshop_client import WebshopClient
+from webshop.profil_handler import ProfileHandler
+from webshop.webshop_orchestration import webshop_orchestration
 
 
 def _delete_order_batch_csvs(batch_files: list[Path], row_number: int) -> None:
@@ -43,7 +44,7 @@ def process_single_order(
     sheets_client,
     order: OrderRow,
     config,
-    bot: Optional[WebshopClient] = None,
+    profile: Optional[ProfileHandler] = None,
     *,
     require_existing_session: bool = False,
 ) -> bool:
@@ -62,7 +63,7 @@ def process_single_order(
             sheet, phase, detail, config, email_id=order.email_id, row_number=order.row_number,
         )
 
-    owns_bot = bot is None
+    owns_profile = profile is None
     batch_files: list[Path] = []
     
     try:
@@ -98,17 +99,19 @@ def process_single_order(
         batch_files = list(payload.batch_files)
         logger.info("Order has %s item row(s) -> %s batch file(s).", payload.total_rows, payload.batch_count)
 
-        if bot is None:
-            bot = WebshopClient(config=config, on_phase=on_phase)
-            bot.start()
-        else:
-            bot.on_phase = on_phase
-
-        bot.run_batch_order(
+        if profile is None:
+            profile = ProfileHandler(config)
+            profile.start()
+        
+        webshop_orchestration(
+            page=profile.page,
+            context=profile.context,
             client_number=order.client_number,
             client_name=order.client_name,
             client_mail=order.client_mail,
             batch_csvs=payload.batch_files,
+            config=config,
+            on_phase=on_phase,
             require_existing_session=require_existing_session,
         )
 
@@ -143,16 +146,15 @@ def process_single_order(
         return False
 
     finally:
-        if owns_bot and bot is not None:
-            bot.stop()
-
+        if owns_profile and profile is not None:
+            profile.stop()
 
 def process_emails(
     max_orders: Optional[int] = None,
     *,
     force_headless: Optional[bool] = None,
     quiet_when_idle: bool = False,
-    bot: Optional[WebshopClient] = None,
+    profile: Optional[ProfileHandler] = None,
     require_existing_session: bool = False,
     logger=None, # Allow injecting logger from main
 ) -> int:
@@ -188,11 +190,11 @@ def process_emails(
         pending = pending[: max(0, max_orders)]
 
     success = 0
-    owns_bot = bot is None
+    owns_profile = profile is None
     try:
-        if bot is None:
-            bot = WebshopClient(config=config)
-            bot.start()
+        if profile is None:
+            profile = ProfileHandler(config)
+            profile.start()
 
         for order in pending:
             ok = process_single_order(
@@ -200,14 +202,14 @@ def process_emails(
                 sheets_client,
                 order,
                 config,
-                bot=bot,
+                profile=profile,
                 require_existing_session=require_existing_session,
             )
             if ok:
                 success += 1
     finally:
-        if owns_bot and bot is not None:
-            bot.stop()
+        if owns_profile and profile is not None:
+            profile.stop()
 
     logger.info("Finished run: %s/%s order(s) succeeded.", success, len(pending))
     return success

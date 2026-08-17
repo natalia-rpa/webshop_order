@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
-
+import pandas as pd
 import gspread
 import requests
 from gspread.exceptions import APIError
@@ -18,47 +17,6 @@ from config_loader import load_config
 from logging_setup import get_logger
 
 logger = get_logger()
-
-
-@dataclass
-class OrderRow:
-    row_number: int  # 1-based sheet row at discovery; may shift when new emails insert
-    client_number: str
-    client_name: str
-    client_mail: str
-    email_id: str  # stable key — re-resolve row before phase/timestamp edits
-    attachments_path: str
-    manual_phase: str
-    robot_phase: str
-    email_title: str
-
-
-def _is_empty(value: Optional[str]) -> bool:
-    return value is None or str(value).strip() == ""
-
-
-def _norm_header(name: str) -> str:
-    return re.sub(r"[\s_]+", "", str(name).strip().lower())
-
-
-def build_header_map(headers: List[str]) -> Dict[str, int]:
-    """Map normalized header -> 0-based column index."""
-    mapping: Dict[str, int] = {}
-    for idx, header in enumerate(headers):
-        key = _norm_header(header)
-        if key and key not in mapping:
-            mapping[key] = idx
-    return mapping
-
-
-def resolve_column(header_map: Dict[str, int], configured_name: str) -> int:
-    key = _norm_header(configured_name)
-    if key not in header_map:
-        raise KeyError(
-            f"Column {configured_name!r} not found in sheet headers. "
-            f"Available: {sorted(header_map)}"
-        )
-    return header_map[key]
 
 
 def safe_update_cell(
@@ -79,16 +37,21 @@ def safe_update_cell(
                 wait = delay * (2 ** (attempt - 1))
                 logger.warning(
                     "Sheets quota hit updating r%s c%s; retry in %.0fs (%s/%s).",
-                    row,
-                    col,
-                    wait,
-                    attempt,
-                    retries,
+                    row,col,wait,attempt,retries,
                 )
                 time.sleep(wait)
                 continue
             raise
 
+def _get_col_idx(headers: List[str], target_name: str, fallback_idx: int = -1) -> int:
+    """Simple helper to find 1-based column index natively."""
+    target = str(target_name).strip().lower()
+    norm_headers = [str(h).strip().lower() for h in headers]
+    if target in norm_headers:
+        return norm_headers.index(target) + 1
+    if fallback_idx > 0:
+        return fallback_idx
+    raise KeyError(f"Column {target_name!r} not found in headers.")
 
 def find_row_by_email_id(
     sheet: gspread.Worksheet,
@@ -99,11 +62,6 @@ def find_row_by_email_id(
 ) -> int:
     """
     Locate the current 1-based sheet row for email_id.
-
-    New inbound emails insert rows and shift existing ones down, so a
-    previously captured row_number can point at the wrong order. Always
-    re-resolve by email_id before writing MANUAL_PHASE / ROBOT_PHASE /
-    TIMESTAMP_PROCESSED_AT.
     """
     email_id = (email_id or "").strip()
     if not email_id:
@@ -115,9 +73,7 @@ def find_row_by_email_id(
     if not values:
         raise LookupError(f"MAIN sheet is empty; cannot find email_id={email_id!r}.")
 
-    headers = values[0]
-    header_map = build_header_map(headers)
-    idx_email = resolve_column(header_map, col_name)
+    idx_email = _get_col_idx(values[0], "email_id") - 1
 
     for row_offset, row in enumerate(values[1:], start=2):
         cell = row[idx_email].strip() if idx_email < len(row) else ""
@@ -175,9 +131,8 @@ def set_robot_phase(
     config = config or load_config()
     row = _resolve_edit_row(sheet, email_id, row_number, config)
     headers = sheet.row_values(1)
-    header_map = build_header_map(headers)
-    col_name = config.get("columns", "robot_phase")
-    col_idx = resolve_column(header_map, col_name) + 1  # 1-based for update_cell
+
+    col_idx = _get_col_idx(headers, "robot_phase")
 
     text = phase.strip()
     if detail and phase.upper() != "FINISHED":
@@ -213,9 +168,8 @@ def set_manual_phase(
     config = config or load_config()
     row = _resolve_edit_row(sheet, email_id, row_number, config)
     headers = sheet.row_values(1)
-    header_map = build_header_map(headers)
-    col_name = config.get("columns", "manual_phase")
-    col_idx = resolve_column(header_map, col_name) + 1  # 1-based for update_cell
+
+    col_idx = _get_col_idx(headers, "manual_phase")
 
     text = phase.strip()
     safe_update_cell(sheet, row, col_idx, text)
@@ -245,20 +199,7 @@ def set_timestamp_processed_at(
     row = _resolve_edit_row(sheet, email_id, row_number, config)
     stamp = (when or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     headers = sheet.row_values(1)
-    header_map = build_header_map(headers)
-    col_name = config.get(
-        "columns", "timestamp_processed_at", fallback="TIMESTAMP_PROCESSED_AT"
-    )
-    try:
-        col_idx = resolve_column(header_map, col_name) + 1  # 1-based
-    except KeyError:
-        # Column K fallback when header is missing / renamed.
-        col_idx = 11
-        logger.warning(
-            "Column %r not in headers; writing TIMESTAMP_PROCESSED_AT to column K.",
-            col_name,
-        )
-
+    col_idx = _get_col_idx(headers, "timestamp_processed_at", fallback_idx=12)
     safe_update_cell(sheet, row, col_idx, stamp)
     logger.info(
         "TIMESTAMP_PROCESSED_AT email_id=%s row %s -> %s",
@@ -269,82 +210,38 @@ def set_timestamp_processed_at(
     return stamp, row
 
 
-def find_pending_orders(
-    sheet: gspread.Worksheet,
-    config=None,
-) -> List[OrderRow]:
+def find_pending_orders(sheet: gspread.Worksheet,config=None) -> pd.DataFrame:
     """
-    Start condition: MANUAL_PHASE == PROCESSING, ROBOT_PHASE empty,
-    and ACTIVE_PHASE (col G) == 5_VALID.
+    Start condition: MANUAL_PHASE == PROCESSING, ROBOT_PHASE == "", ACTIVE_PHASE == 5_VALID.
     """
-    config = config or load_config()
-    start_manual = config.get("phases", "start_manual").strip().upper()
-    start_active = config.get("phases", "start_active", fallback="5_VALID").strip().upper()
-    cols = config["columns"]
 
     values = sheet.get_all_values()
-    if not values:
+    if not values or len(values) < 2:
         logger.warning("MAIN sheet is empty.")
-        return []
+        return pd.DataFrame()
 
     headers = values[0]
-    header_map = build_header_map(headers)
+    
+    full_df = pd.DataFrame(values[1:], columns=[str(h).strip().lower() for h in headers])
+    full_df["row_number"] = full_df.index + 2
 
-    idx_client_number = resolve_column(header_map, cols.get("client_number"))
-    idx_client_name = resolve_column(header_map, cols.get("client_name"))
-    idx_email_id = resolve_column(header_map, cols.get("email_id"))
-    idx_client_mail = resolve_column(header_map, cols.get("client_mail", "MAIL"))
-    idx_attachments = resolve_column(header_map, cols.get("attachments_path"))
-    idx_manual = resolve_column(header_map, cols.get("manual_phase"))
-    idx_robot = resolve_column(header_map, cols.get("robot_phase"))
-    active_col_name = cols.get("active_phase", "ACTIVE_PHASE")
-    idx_email_title = resolve_column(header_map, cols.get("email_title", "EMAIL_TITLE"))
-    try:
-        idx_active = resolve_column(header_map, active_col_name)
-    except KeyError:
-        # Column G fallback when header is missing / renamed.
-        idx_active = 6
-        logger.warning(
-            "Column %r not in headers; reading ACTIVE_PHASE from column G.",
-            active_col_name,
-        )
 
-    pending: List[OrderRow] = []
-    for row_offset, row in enumerate(values[1:], start=2):
-        def cell(i: int) -> str:
-            return row[i].strip() if i < len(row) else ""
+    manual_col = full_df.get("manual_phase", pd.Series("", index=full_df.index)).astype(str)
+    robot_col = full_df.get("robot_phase", pd.Series("", index=full_df.index)).astype(str)
+    active_col = full_df.get("active_phase", pd.Series("", index=full_df.index)).astype(str)
 
-        manual = cell(idx_manual)
-        robot = cell(idx_robot)
-        active = cell(idx_active)
-        if (
-            manual.upper() != start_manual
-            or not _is_empty(robot)
-            or active.upper() != start_active
-        ):
-            continue
-
-        order = OrderRow(
-            row_number=row_offset,
-            client_number=cell(idx_client_number),
-            client_name=cell(idx_client_name),
-            email_id=cell(idx_email_id),
-            client_mail=cell(idx_client_mail),
-            attachments_path=cell(idx_attachments),
-            manual_phase=manual,
-            robot_phase=robot,
-            email_title=cell(idx_email_title),
-        )
-        pending.append(order)
+    pending_mask = (
+        (manual_col.str.strip().str.upper() == "PROCESSING") &
+        (robot_col.str.strip() == "READY") &
+        (active_col.str.strip().str.upper() == "5_VALID")
+    )
+    pending_orders_df = full_df[pending_mask]
 
     logger.info(
-        "Found %s pending order row(s) "
-        "(MANUAL_PHASE=%s, ROBOT_PHASE empty, ACTIVE_PHASE=%s).",
-        len(pending),
-        start_manual,
-        start_active,
+        "Found %s pending order row(s) manual_phase=PROCESSING, robot_phase READY, active_phase=5_VALID).",
+        len(pending_orders_df),
     )
-    return pending
+    return pending_orders_df
 
 
 def _extract_drive_file_id(path_or_url: str) -> Optional[str]:
@@ -581,14 +478,15 @@ def _download_drive_file(
 
 def extract_order_payload(
     sheet: gspread.Worksheet,
-    order: OrderRow,
+    order: pd.Series,
     sheets_client: gspread.Client,
     config=None,
-) -> Tuple[OrderRow, Path]:
+) -> Tuple[pd.Series, Path]:
     """Download / export attachment CSV for the order row and return path."""
     config = config or load_config()
     downloads = config.get("webshop", "downloads_dir")
-    order.row_number = set_robot_phase(
+
+    order["row_number"] = set_robot_phase(
         sheet,
         "PROCESSING",
         "Downloading attachment CSV",

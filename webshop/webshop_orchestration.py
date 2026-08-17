@@ -19,6 +19,7 @@ from logging_setup import get_logger
 from playwright.sync_api import BrowserContext, Page
 from webshop import login_handler
 
+import pandas as pd
 logger = get_logger()
 PhaseCallback = Callable[[str, str], None]
 
@@ -26,10 +27,7 @@ PhaseCallback = Callable[[str, str], None]
 def webshop_orchestration(
     page: Page,
     context: BrowserContext,
-    client_number: str,
-    client_name: str,
-    client_mail: str,
-    email_title: str,
+    order: pd.Series,
     batch_csvs: Sequence[str | Path],
     config=None,
     on_phase: Optional[PhaseCallback] = None,
@@ -41,6 +39,11 @@ def webshop_orchestration(
     file uploads, and browser teardown inline.
     """
     cfg = config or load_config()
+
+    client_number = str(order.get("client_number", ""))
+    client_name = str(order.get("client_name", ""))
+    client_mail = str(order.get("client_mail", ""))
+    email_title = str(order.get("email_title", ""))
     
     paths: List[Path] = [Path(p).resolve() for p in batch_csvs]
     if not paths:

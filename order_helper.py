@@ -7,14 +7,13 @@ from __future__ import annotations
 import traceback
 from pathlib import Path
 from typing import Optional
-
+import pandas as pd
 from auth import init_connections
 from config_loader import batch_max_rows, ensure_runtime_dirs, load_config
 from csv_utils import prepare_batch_payload
 from logging_setup import get_logger
 
 from spreadsheet_processing import (
-    OrderRow,
     extract_order_payload,
     find_pending_orders,
     set_manual_phase,
@@ -42,7 +41,7 @@ def _delete_order_batch_csvs(batch_files: list[Path], row_number: int) -> None:
 def process_single_order(
     sheet,
     sheets_client,
-    order: OrderRow,
+    order: pd.Series,
     config,
     profile: Optional[ProfileHandler] = None,
     *,
@@ -53,13 +52,17 @@ def process_single_order(
     Returns True on success.
     """
     logger = get_logger()
+    email_id = str(order.email_id).strip()
+    client_number = str(order.client_number).strip()
+    client_name = str(order.client_name).strip()
+    row_number = int(order.row_number)
+
     logger.info(
-        "Process started for client_number=%s client_name=%s emailID=%s row=%s",
-        order.client_number, order.client_name, order.email_id, order.row_number,
+        "Process started for client_number=%s client_name=%s emailID=%s row=%s", client_number, client_name, email_id, row_number
     )
 
     def on_phase(phase: str, detail: str) -> None:
-        order.row_number = set_robot_phase(
+        order["row_number"] = set_robot_phase(
             sheet, phase, detail, config, email_id=order.email_id, row_number=order.row_number,
         )
 
@@ -70,10 +73,10 @@ def process_single_order(
         if not order.email_id:
             raise ValueError("email_id is empty on processing row; cannot safely edit phases.")
 
-        _, order.row_number = set_timestamp_processed_at(
+        _, order["row_number"]= set_timestamp_processed_at(
             sheet, config, email_id=order.email_id, row_number=order.row_number,
         )
-        order.row_number = set_robot_phase(
+        order["row_number"] = set_robot_phase(
             sheet, "PROCESSING", "Extracting row data", config, email_id=order.email_id, row_number=order.row_number,
         )
 
@@ -85,7 +88,7 @@ def process_single_order(
         _, source_csv = extract_order_payload(sheet, order, sheets_client, config)
 
         max_rows = batch_max_rows(config)
-        order.row_number = set_robot_phase(
+        order["row_number"] = set_robot_phase(
             sheet, "PROCESSING", f"Preparing A/B CSV batches (max {max_rows} rows)", config, 
             email_id=order.email_id, row_number=order.row_number,
         )
@@ -106,10 +109,7 @@ def process_single_order(
         webshop_orchestration(
             page=profile.page,
             context=profile.context,
-            client_number=order.client_number,
-            client_name=order.client_name,
-            client_mail=order.client_mail,
-            email_title=order.email_title,
+            order=order,
             batch_csvs=payload.batch_files,
             config=config,
             on_phase=on_phase,
@@ -117,11 +117,11 @@ def process_single_order(
         )
 
         # Mark as finished
-        order.row_number = set_robot_phase(
+        order["row_number"] = set_robot_phase(
             sheet, "FINISHED", "FINISHED", config, email_id=order.email_id, row_number=order.row_number,
         )
         finished_manual = config.get("phases", "finished_manual", fallback="FINISHED").strip()
-        order.row_number = set_manual_phase(
+        order["row_number"] = set_manual_phase(
             sheet, finished_manual, config, email_id=order.email_id, row_number=order.row_number,
         )
         
@@ -135,11 +135,11 @@ def process_single_order(
         logger.error(traceback.format_exc())
         
         try:
-            order.row_number = set_robot_phase(
+            order["row_number"]= set_robot_phase(
                 sheet, "ERROR", reason, config, email_id=order.email_id, row_number=order.row_number,
             )
             error_manual = config.get("phases", "error_manual", fallback="ERROR").strip()
-            order.row_number = set_manual_phase(
+            order["row_number"] = set_manual_phase(
                 sheet, error_manual, config, email_id=order.email_id, row_number=order.row_number,
             )
         except Exception as sheet_exc:
@@ -178,8 +178,9 @@ def process_emails(
     if not quiet_when_idle:
         logger.info("Sheets connection ready.")
 
-    pending = find_pending_orders(main_sheet, config)
-    if not pending:
+    pending_orders_df = find_pending_orders(main_sheet, config)
+    
+    if pending_orders_df.empty:
         msg = "No rows ready (MANUAL_PHASE=PROCESSING & ROBOT_PHASE empty & ACTIVE_PHASE=5_VALID)."
         if quiet_when_idle:
             logger.debug(msg)
@@ -188,7 +189,7 @@ def process_emails(
         return 0
 
     if max_orders is not None:
-        pending = pending[: max(0, max_orders)]
+        pending_orders_df = pending_orders_df.head(max(0, max_orders))
 
     success = 0
     owns_profile = profile is None
@@ -197,7 +198,7 @@ def process_emails(
             profile = ProfileHandler(config)
             profile.start()
 
-        for order in pending:
+        for index, order in pending_orders_df.iterrows():
             ok = process_single_order(
                 main_sheet,
                 sheets_client,
@@ -212,5 +213,5 @@ def process_emails(
         if owns_profile and profile is not None:
             profile.stop()
 
-    logger.info("Finished run: %s/%s order(s) succeeded.", success, len(pending))
+    logger.info("Finished run: %s/%s order(s) succeeded.", success, len(pending_orders_df))
     return success

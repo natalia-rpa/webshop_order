@@ -109,6 +109,7 @@ def process_single_order(
             client_number=order.client_number,
             client_name=order.client_name,
             client_mail=order.client_mail,
+            email_title=order.email_title,
             batch_csvs=payload.batch_files,
             config=config,
             on_phase=on_phase,

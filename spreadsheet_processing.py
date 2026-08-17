@@ -30,6 +30,7 @@ class OrderRow:
     attachments_path: str
     manual_phase: str
     robot_phase: str
+    email_title: str
 
 
 def _is_empty(value: Optional[str]) -> bool:
@@ -297,6 +298,7 @@ def find_pending_orders(
     idx_manual = resolve_column(header_map, cols.get("manual_phase"))
     idx_robot = resolve_column(header_map, cols.get("robot_phase"))
     active_col_name = cols.get("active_phase", "ACTIVE_PHASE")
+    idx_email_title = resolve_column(header_map, cols.get("email_title", "EMAIL_TITLE"))
     try:
         idx_active = resolve_column(header_map, active_col_name)
     except KeyError:
@@ -331,6 +333,7 @@ def find_pending_orders(
             attachments_path=cell(idx_attachments),
             manual_phase=manual,
             robot_phase=robot,
+            email_title=cell(idx_email_title),
         )
         pending.append(order)
 

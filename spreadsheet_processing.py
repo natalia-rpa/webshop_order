@@ -135,12 +135,8 @@ def set_robot_phase(
     col_idx = _get_col_idx(headers, "robot_phase")
 
     text = phase.strip()
-    if detail and phase.upper() != "FINISHED":
-        text = f"{phase} - {detail}"
-    elif detail and phase.upper() == "FINISHED":
-        text = detail if detail.upper() == "FINISHED" else f"FINISHED - {detail}"
-    elif phase.upper() == "FINISHED":
-        text = "FINISHED"
+    if detail and detail.upper() != text.upper():
+        text = f"{text} - {detail}"
 
     safe_update_cell(sheet, row, col_idx, text)
     logger.info(
